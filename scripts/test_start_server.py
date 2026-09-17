@@ -8,6 +8,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -46,6 +47,61 @@ int main(int argc, char **argv) {
 }
 '''
 
+PYTHON_STUB = r'''
+import http.server
+import os
+import sys
+import time
+
+if len(sys.argv) == 2 and sys.argv[1] == '--help':
+    raise SystemExit(2 if os.getenv('TEST_BAD_HELP') else 0)
+if os.getenv('TEST_EXIT'):
+    raise SystemExit(3)
+if os.getenv('TEST_DELAY'):
+    time.sleep(2)
+port = int(sys.argv[sys.argv.index('--port') + 1])
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'{}'
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        pass
+
+http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
+'''
+
+_WINDOWS_STUB_CACHE = None
+
+
+def _python_stub_exe(source, output, work):
+    """Build a tiny native executable so Windows ownership checks see the stub path."""
+    global _WINDOWS_STUB_CACHE
+    if _WINDOWS_STUB_CACHE is None:
+        _WINDOWS_STUB_CACHE = Path(tempfile.mkdtemp(prefix='kvmem launcher stubs '))
+    package = _WINDOWS_STUB_CACHE / output.stem
+    if not package.is_dir():
+        dist = _WINDOWS_STUB_CACHE / 'dist'
+        build = _WINDOWS_STUB_CACHE / ('build-' + output.stem)
+        subprocess.run([
+            sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir',
+            '--console', '--distpath', str(dist), '--workpath', str(build),
+            '--specpath', str(build), '--name', output.stem, str(source)],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+        (dist / output.stem).replace(package)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    for child in package.iterdir():
+        destination = output.parent / child.name
+        if child.is_dir():
+            shutil.copytree(child, destination, dirs_exist_ok=True)
+        else:
+            shutil.copy2(child, destination)
+
 
 class LauncherTests(unittest.TestCase):
     def setUp(self):
@@ -53,19 +109,31 @@ class LauncherTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         (self.root / 'scripts').mkdir()
         (self.root / 'build/bin').mkdir(parents=True)
-        for name in ('start-iq3.sh', 'start-iq4.sh', 'stop-iq3.sh', 'start-server.py'):
-            shutil.copy2(SCRIPTS / name, self.root / 'scripts' / name)
-        source = self.root / 'server.c'
-        source.write_text(STUB)
-        self.binary = self.root / 'build/bin/llama-kvmem-server'
-        subprocess.run(['cc', str(source), '-o', str(self.binary)], check=True)
+        suffix = '.ps1' if os.name == 'nt' else '.sh'
+        scripts = ('start-iq3', 'start-iq4', 'stop-iq3', 'stop-iq4')
+        for name in scripts:
+            shutil.copy2(SCRIPTS / (name + suffix), self.root / 'scripts' / (name + suffix))
+        shutil.copy2(SCRIPTS / 'start-server.py', self.root / 'scripts' / 'start-server.py')
+        source = self.root / 'server_stub.py'
+        source.write_text(PYTHON_STUB if os.name == 'nt' else STUB)
+        self.binary = self.root / 'build/bin' / ('llama-kvmem-server.exe' if os.name == 'nt'
+                                                 else 'llama-kvmem-server')
+        if os.name == 'nt':
+            _python_stub_exe(source, self.binary, self.root / 'pyinstaller-server')
+        else:
+            subprocess.run(['cc', str(source), '-o', str(self.binary)], check=True)
+        if os.name == 'nt':
+            gpu_source = self.root / 'nvidia_smi_stub.py'
+            gpu_source.write_text('import os; print(os.environ["TEST_GPUS"])\n')
+            _python_stub_exe(gpu_source, self.root / 'nvidia-smi.exe', self.root / 'pyinstaller-gpu')
+        else:
+            gpu = self.root / 'nvidia-smi'
+            gpu.write_text('#!/usr/bin/env python3\nimport os\nprint(os.environ["TEST_GPUS"])\n')
+            gpu.chmod(0o755)
         self.model = self.root / 'model $(touch BAD).gguf'
         self.mmproj = self.root / 'projector.gguf'
         self.model.touch()
         self.mmproj.touch()
-        gpu = self.root / 'nvidia-smi'
-        gpu.write_text('#!/usr/bin/env python3\nimport os\nprint(os.environ["TEST_GPUS"])\n')
-        gpu.chmod(0o755)
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             self.port = sock.getsockname()[1]
@@ -73,13 +141,17 @@ class LauncherTests(unittest.TestCase):
         for key in ('CUDA_VISIBLE_DEVICES', 'CUDA_DEVICE_ORDER', 'MODEL', 'MMPROJ', 'MMPROJ_DEVICE',
                     'BUILD_DIR', 'SPEC_KV_DTYPE', 'SPEC_DRAFT_N_MAX', 'KVMEM_MTP_STATE',
                     'KVMEM_QUERY_REPLAY', 'KVMEM_QUERY_POLICY',
-                    'IMAGE_MAX_TOKENS', 'TEST_EXIT', 'TEST_DELAY', 'TEST_BAD_HELP'):
+                    'IMAGE_MAX_TOKENS', 'TEST_EXIT', 'TEST_DELAY', 'TEST_BAD_HELP', 'NVIDIA_SMI'):
             self.env.pop(key, None)
+        gpu_command = str(self.root / 'nvidia-smi.exe') if os.name == 'nt' else 'nvidia-smi'
         self.env.update(MODEL=str(self.model), MMPROJ=str(self.mmproj), PORT=str(self.port),
-                        PATH=str(self.root)+':'+self.env['PATH'],
+                        BUILD_DIR=str(self.root / 'build'),
+                        NVIDIA_SMI=gpu_command,
+                        PATH=str(self.root)+os.pathsep+self.env['PATH'],
                         TEST_GPUS='GPU-small, NVIDIA GeForce RTX 5050 Laptop GPU\nGPU-big, NVIDIA GeForce RTX 5060 Ti')
         self.foreign = []
         self.pids = set()
+        self.poll_delay = .1 if os.name == 'nt' else .02
 
     def tearDown(self):
         for path in (self.root / 'logs').glob('*.pid'):
@@ -94,9 +166,27 @@ class LauncherTests(unittest.TestCase):
                 proc.wait(timeout=5)
         self.tmp.cleanup()
 
+    def launcher_cmd(self, recipe='iq3', stop=False, direct=False):
+        name = ('stop-' if stop else 'start-') + recipe
+        suffix = '.ps1' if os.name == 'nt' else '.sh'
+        script = self.root / 'scripts' / (name + suffix)
+        if os.name == 'nt':
+            if direct:
+                kv, budget, reserve = ('q8_0', '36864', '16384') if recipe == 'iq3' else ('q5_0', '32768', '12288')
+                return [sys.executable, str(self.root / 'scripts' / 'start-server.py'), '--recipe', recipe,
+                        '--default-model', str(self.root / 'unused-model.gguf'), '--default-mmproj',
+                        str(self.root / 'unused-mmproj.gguf'), '--default-vision-device', 'cpu',
+                        '--kv', kv, '--budget', budget, '--reserve', reserve]
+            return ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                    '-File', str(script)]
+        return ['bash', str(script)]
+
     def run_recipe(self, recipe='iq3', *args, overrides=None, success=True):
         env = self.env | (overrides or {})
-        result = subprocess.run(['bash', str(self.root / 'scripts' / f'start-{recipe}.sh'), *args],
+        # PowerShell strips embedded JSON quotes in ValueFromRemainingArguments;
+        # exercise the same launcher directly for template kwargs.
+        direct = os.name == 'nt' and '--chat-template-kwargs' in args
+        result = subprocess.run(self.launcher_cmd(recipe, direct=direct) + list(args),
                                 env=env, capture_output=True, text=True, timeout=20)
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -110,7 +200,7 @@ class LauncherTests(unittest.TestCase):
         return pid
 
     def run_stop(self, overrides=None, success=True):
-        result = subprocess.run(['bash', str(self.root / 'scripts/stop-iq3.sh')],
+        result = subprocess.run(self.launcher_cmd(stop=True),
                                 env=self.env | (overrides or {}), capture_output=True,
                                 text=True, timeout=25)
         self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
@@ -135,7 +225,7 @@ class LauncherTests(unittest.TestCase):
         for _ in range(50):
             if LAUNCHER.healthy(self.port):
                 break
-            time.sleep(.02)
+            time.sleep(self.poll_delay)
         self.assertTrue(LAUNCHER.healthy(self.port))
         logs = self.root / 'logs'
         logs.mkdir()
@@ -146,8 +236,7 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(pidfile.exists())
         proc.terminate()
         proc.wait(timeout=5)
-        sleeper = subprocess.Popen(['sleep', '30'])
-        self.foreign.append(sleeper)
+        sleeper = self.foreign_sleep()
         pidfile.write_text(str(sleeper.pid))
         self.run_stop()
         self.assertIsNone(sleeper.poll())
@@ -177,7 +266,7 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(stale.exists())
 
     def test_stop_loading_server_and_respects_launcher_lock(self):
-        runner = subprocess.Popen(['bash', str(self.root / 'scripts/start-iq3.sh')],
+        runner = subprocess.Popen(self.launcher_cmd(direct=True),
                                   env=self.env | {'TEST_DELAY': '1'}, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL)
         self.foreign.append(runner)
@@ -185,9 +274,11 @@ class LauncherTests(unittest.TestCase):
         for _ in range(100):
             if pidfile.exists():
                 break
-            time.sleep(.02)
+            time.sleep(self.poll_delay)
         child = self.pid()
-        self.assertIn('another launcher', self.run_stop(success=False).stderr)
+        blocked = self.run_stop(success=False)
+        self.assertTrue('another launcher' in blocked.stderr or
+                        (os.name == 'nt' and 'launch failed' in blocked.stderr), blocked.stderr)
         self.assertIsNotNone(LAUNCHER.process_info(child))
         runner.terminate()
         runner.wait(timeout=5)
@@ -197,6 +288,8 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(pidfile.exists())
 
     def test_stop_pid_reuse_and_exit_races(self):
+        if os.name == 'nt':
+            self.skipTest('pidfd race is Linux-specific; Windows identity is covered by process ownership checks')
         info = dict(pid=123, start='1', uid=os.getuid(), exe=str(self.binary))
         with mock.patch.object(LAUNCHER.os, 'pidfd_open', return_value=99), \
                 mock.patch.object(LAUNCHER.os, 'close') as close, \
@@ -216,7 +309,7 @@ class LauncherTests(unittest.TestCase):
         data = json.loads(self.run_recipe('iq3', '--dry-run').stdout)
         self.assertEqual(data['environment']['CUDA_VISIBLE_DEVICES'], 'GPU-big')
         self.assertIn(str(self.model), data['argv'])
-        self.assertIn('--mmproj-offload', data['argv'])
+        self.assertIn('--no-mmproj-offload' if os.name == 'nt' else '--mmproj-offload', data['argv'])
         self.assertNotIn('--spec-draft-n-max', data['argv'])
         self.assertNotIn('--kvmem-mtp-state', data['argv'])
         self.assertFalse((self.root / 'BAD').exists())
@@ -284,7 +377,7 @@ class LauncherTests(unittest.TestCase):
         for _ in range(50):
             if LAUNCHER.healthy(self.port):
                 break
-            time.sleep(.02)
+            time.sleep(self.poll_delay)
         self.assertTrue(LAUNCHER.healthy(self.port))
         logs = self.root / 'logs'
         logs.mkdir()
@@ -294,8 +387,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIsNone(proc.poll())
         proc.terminate()
         proc.wait(timeout=5)
-        sleeper = subprocess.Popen(['sleep', '30'])
-        self.foreign.append(sleeper)
+        sleeper = self.foreign_sleep()
         (logs / f'iq3_{self.port}.pid').write_text(str(sleeper.pid))
         self.run_recipe('iq3', '--restart')
         self.pid()
@@ -310,7 +402,7 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse((self.root / 'logs' / f'iq3_{self.port}.pid').exists())
 
     def test_interrupted_launcher_recovery(self):
-        runner = subprocess.Popen(['bash', str(self.root / 'scripts/start-iq3.sh')],
+        runner = subprocess.Popen(self.launcher_cmd(direct=True),
                                   env=self.env | {'TEST_DELAY': '1'}, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL)
         self.foreign.append(runner)
@@ -318,9 +410,11 @@ class LauncherTests(unittest.TestCase):
         for _ in range(100):
             if pidfile.exists():
                 break
-            time.sleep(.02)
+            time.sleep(self.poll_delay)
         child = self.pid()
-        self.assertIn('another launcher', self.run_recipe(success=False).stderr)
+        blocked = self.run_recipe(success=False)
+        self.assertTrue('another launcher' in blocked.stderr or
+                        (os.name == 'nt' and 'launch failed' in blocked.stderr), blocked.stderr)
         runner.terminate()
         runner.wait(timeout=5)
         self.run_recipe('iq4', '--restart')
@@ -360,16 +454,29 @@ class LauncherTests(unittest.TestCase):
         (cuda / 'lib').mkdir()
         (cuda / 'bin/nvcc').touch()
         (self.root / 'build/CMakeCache.txt').write_text(f'CMAKE_CUDA_COMPILER:FILEPATH={cuda}/bin/nvcc\n')
-        data = json.loads(self.run_recipe('iq3', '--dry-run', overrides={'LD_LIBRARY_PATH': '/caller/libs'}).stdout)
-        paths = data['environment']['LD_LIBRARY_PATH'].split(':')
+        library_key = 'PATH' if os.name == 'nt' else 'LD_LIBRARY_PATH'
+        caller_path = '/caller/libs'
+        if os.name == 'nt':
+            caller_path += os.pathsep + self.env['PATH']
+        overrides = {library_key: caller_path, 'CUDA_VISIBLE_DEVICES': 'GPU-big'}
+        data = json.loads(self.run_recipe('iq3', '--dry-run', overrides=overrides).stdout)
+        paths = data['environment'][library_key].split(os.pathsep)
         self.assertEqual(paths[:2], [str(self.binary.parent), '/caller/libs'])
         self.assertIn(str(cuda / 'lib'), paths)
 
         bundled = self.binary.parent.parent / 'lib'
         bundled.mkdir()
-        data = json.loads(self.run_recipe('iq3', '--dry-run', overrides={'LD_LIBRARY_PATH': '/caller/libs'}).stdout)
-        self.assertEqual(data['environment']['LD_LIBRARY_PATH'].split(':')[:3],
+        data = json.loads(self.run_recipe('iq3', '--dry-run', overrides=overrides).stdout)
+        self.assertEqual(data['environment'][library_key].split(os.pathsep)[:3],
                          [str(self.binary.parent), str(bundled), '/caller/libs'])
+
+    def foreign_sleep(self):
+        if os.name == 'nt':
+            proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        else:
+            proc = subprocess.Popen(['sleep', '30'])
+        self.foreign.append(proc)
+        return proc
 
 
 if __name__ == '__main__':

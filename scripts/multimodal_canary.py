@@ -12,15 +12,17 @@ from pathlib import Path
 import re
 import struct
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 import zlib
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mtp_kv_ab import Sampler, stop_server
+import gpu_env
 
 ROOT = Path(__file__).resolve().parents[1]
-GPU = 'GPU-5847813c-9e6e-bb43-cc5e-621aac091b6c'
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -49,7 +51,7 @@ def fixture(size=896, changed=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--binary', type=Path, default=ROOT / 'build/bin/llama-kvmem-server')
+    ap.add_argument('--binary', type=Path, default=None)
     ap.add_argument('--model', type=Path, default=ROOT / 'models/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf')
     ap.add_argument('--mmproj', type=Path, default=ROOT / 'models/unsloth/Qwen3.8-27B-GGUF/mmproj-Q8_0.gguf')
     ap.add_argument('--no-projector', action='store_true')
@@ -91,6 +93,10 @@ def main():
                     help='Model loading deadline in seconds (excluded from runtime metrics)')
     ap.add_argument('--expect-capacity-error', action='store_true')
     args = ap.parse_args()
+    if args.binary is None:
+        args.binary = gpu_env.find_binary('llama-kvmem-server')
+        if args.binary is None:
+            ap.error('llama-kvmem-server not found; set --binary or build the project')
     if args.thinking_budget is not None and args.thinking_budget < 0:
         ap.error('--thinking-budget must be nonnegative')
     if args.mtp < 1:
@@ -119,10 +125,8 @@ def main():
     encoded = base64.b64encode(image).decode()
     part = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + encoded}}
     changed = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + base64.b64encode(fixture(changed=True)).decode()}}
-    env = os.environ.copy()
-    env.update(CUDA_VISIBLE_DEVICES=GPU, CUDA_DEVICE_ORDER='PCI_BUS_ID',
-               LD_LIBRARY_PATH=str(args.binary.resolve().parent) + ':/home/leye/kvmem_qw3/.cu13-env/lib',
-               NO_PROXY='127.0.0.1,localhost', no_proxy='127.0.0.1,localhost')
+    env = gpu_env.apply_gpu(os.environ.copy(), 'small')
+    env.update(NO_PROXY='127.0.0.1,localhost', no_proxy='127.0.0.1,localhost')
     if args.trace:
         env['KVMEM_TRACE'] = '1'
     cmd = [str(args.binary.resolve()),
@@ -147,12 +151,17 @@ def main():
     if args.no_kvmem:
         cmd += ['--no-kvmem']
     (folder / 'argv.json').write_text(json.dumps(cmd, indent=2))
-    nvml = ctypes.CDLL('libnvidia-ml.so.1')
+    nvml = ctypes.CDLL('nvml.dll' if os.name == 'nt' else 'libnvidia-ml.so.1')
     assert nvml.nvmlInit_v2() == 0
     device = ctypes.c_void_p()
-    assert nvml.nvmlDeviceGetHandleByUUID(GPU.encode(), ctypes.byref(device)) == 0
+    gpu_uuid = env['CUDA_VISIBLE_DEVICES']
+    assert nvml.nvmlDeviceGetHandleByUUID(gpu_uuid.encode(), ctypes.byref(device)) == 0
     sampler = Sampler(nvml, device, folder)
     def system_swap():
+        if os.name == 'nt':
+            # Windows has no Linux-style swap counter. Keep this diagnostic
+            # explicitly unavailable rather than relabeling commit as swap.
+            return 0.0, 'Windows swap counters unavailable; see private/commit columns.'
         raw = Path('/proc/meminfo').read_text()
         values = dict((k, int(v)) for k, v in re.findall(r'^(SwapTotal|SwapFree):\s+(\d+)', raw, re.M))
         return (values['SwapTotal'] - values['SwapFree']) / 1024, raw
@@ -169,22 +178,43 @@ def main():
         start = time.monotonic()
         with (folder / 'rss.csv').open('w') as output:
             writer = csv.writer(output)
-            writer.writerow(['elapsed_s', 'phase', 'rss_mib', 'anon_mib', 'file_mib', 'swap_mib'])
+            headers = (['elapsed_s', 'phase', 'working_set_mib', 'private_mib', 'commit_mib']
+                       if os.name == 'nt' else
+                       ['elapsed_s', 'phase', 'rss_mib', 'anon_mib', 'file_mib', 'swap_mib'])
+            writer.writerow(headers)
             while not rss_stop.is_set():
                 try:
-                    status = Path(f'/proc/{proc.pid}/status').read_text()
-                    match = re.search(r'^VmRSS:\s+(\d+)', status, re.M)
-                    if match:
+                    if os.name == 'nt':
+                        result = subprocess.run(
+                            ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+                             f"$p=Get-Process -Id {int(proc.pid)} -ErrorAction Stop; "
+                             "[pscustomobject]@{WorkingSet=$p.WorkingSet64;Private=$p.PrivateMemorySize64;Commit=$p.VirtualMemorySize64}|ConvertTo-Json -Compress"],
+                            capture_output=True, text=True, check=True, timeout=5)
+                        memory = json.loads(result.stdout)
+                        status = json.dumps(memory)
+                        value = int(memory['WorkingSet']) / 2**20
+                        extra = [int(memory['Private']) / 2**20, int(memory['Commit']) / 2**20]
+                    else:
+                        status = Path(f'/proc/{proc.pid}/status').read_text()
+                        match = re.search(r'^VmRSS:\s+(\d+)', status, re.M)
+                        if not match:
+                            raise FileNotFoundError(proc.pid)
                         value = int(match[1]) / 1024
-                        phase = sampler.phase
-                        rss_samples.append(value)
-                        rss_phase_peaks[phase] = max(rss_phase_peaks.get(phase, 0), value)
                         extra = []
                         for field in ('RssAnon', 'RssFile', 'VmSwap'):
                             m = re.search(r'^' + field + r':\s+(\d+)', status, re.M)
                             extra.append(int(m[1]) / 1024 if m else None)
-                        writer.writerow([time.monotonic() - start, phase, value, *extra])
-                        output.flush()
+                    phase = sampler.phase
+                    rss_samples.append(value)
+                    rss_phase_peaks[phase] = max(rss_phase_peaks.get(phase, 0), value)
+                    writer.writerow([time.monotonic() - start, phase, value, *extra])
+                    output.flush()
+                    if os.name == 'nt':
+                        # Private bytes and commit are recorded above; no swap
+                        # threshold is evaluated on Windows.
+                        rss_stop.wait(.2)
+                        continue
+                    else:
                         used_swap, meminfo = system_swap()
                         if (extra[-1] is not None and extra[-1] >= args.swap_stop_mib) or used_swap - baseline_swap >= args.system_swap_growth_stop_mib:
                             swap_stop.update(phase=phase, pid=proc.pid, process_swap_mib=extra[-1],

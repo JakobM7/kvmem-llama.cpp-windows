@@ -36,9 +36,8 @@ SPEC_RE = re.compile(r"accept_pct=([\d.]+)")
 
 
 def find_cli() -> Path:
-    for p in (ROOT / "build/bin/llama-kvmem-cli", ROOT / "build/llama-kvmem-cli"):
-        if p.is_file():
-            return p
+    if p := gpu_env.find_binary("llama-kvmem-cli"):
+        return p
     raise SystemExit("llama-kvmem-cli not found; run scripts/build-cuda.sh")
 
 

@@ -25,9 +25,10 @@ import gpu_env  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = ROOT / "models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf"
-PROG_SRC = Path("/tmp/kvmem_prog_60k.txt")
+PROG_SRC = Path(os.environ.get("KVMEM_PROG_SRC", ROOT / "logs" / "kvmem_prog_60k.txt"))
 NEEDLE = "The secret code is BLUEBIRD-42."
 GPU_UUID = gpu_env.UUID_5090
+GPU_NAME = "RTX 5090"
 
 TOOLS = [{
     "type": "function",
@@ -44,16 +45,25 @@ TOOLS = [{
 
 
 def find_server() -> Path:
-    for p in (ROOT / "build/bin/llama-kvmem-server", ROOT / "build/llama-kvmem-server"):
+    name = "llama-kvmem-server.exe" if os.name == "nt" else "llama-kvmem-server"
+    build_dir = Path(os.environ["KVMEM_BUILD_DIR"]) if os.environ.get("KVMEM_BUILD_DIR") else None
+    candidates = ([build_dir / "bin" / name, build_dir / name] if build_dir else [])
+    candidates += [ROOT / "build/bin" / name, ROOT / "build" / name,
+                   ROOT / "build-windows/bin" / name, ROOT / "build-windows" / name,
+                   ROOT / "bin" / name]
+    for p in candidates:
         if p.is_file():
             return p
     raise SystemExit("llama-kvmem-server not found; run scripts/build-cuda.sh")
 
 
 def load_notes() -> str:
-    if not PROG_SRC.is_file():
-        raise SystemExit(f"missing {PROG_SRC}")
-    body = PROG_SRC.read_text()
+    source = PROG_SRC
+    if not source.is_file() and os.name != "nt":
+        source = Path("/tmp/kvmem_prog_60k.txt")
+    if not source.is_file():
+        raise SystemExit(f"missing {source}")
+    body = source.read_text()
     if "<|im_start|>user" in body:
         body = body.split("<|im_start|>user\n", 1)[1]
         body = body.split("<|im_end|>", 1)[0]
@@ -100,7 +110,7 @@ def snapshot_mem(pid: int) -> dict:
     try:
         out = subprocess.check_output(
             [
-                "nvidia-smi",
+                os.environ.get("NVIDIA_SMI", "nvidia-smi.exe" if os.name == "nt" else "nvidia-smi"),
                 "--query-gpu=uuid,memory.used,utilization.gpu",
                 "--format=csv,noheader,nounits",
             ],
@@ -113,22 +123,34 @@ def snapshot_mem(pid: int) -> dict:
                 gpu_util = int(float(parts[2]))
     except Exception:
         pass
-    rss_kib = hwm_kib = -1
+    working_set_kib = private_kib = commit_kib = -1
     try:
-        st = Path(f"/proc/{pid}/status").read_text()
-        for ln in st.splitlines():
-            if ln.startswith("VmRSS:"):
-                rss_kib = int(ln.split()[1])
-            elif ln.startswith("VmHWM:"):
-                hwm_kib = int(ln.split()[1])
+        if os.name == "nt":
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                 f"$p=Get-Process -Id {int(pid)} -ErrorAction Stop; "
+                 "[pscustomobject]@{WorkingSet=$p.WorkingSet64;Private=$p.PrivateMemorySize64;Commit=$p.VirtualMemorySize64}|ConvertTo-Json -Compress"],
+                check=True, capture_output=True, text=True, timeout=5)
+            memory = json.loads(result.stdout)
+            working_set_kib = int(memory["WorkingSet"]) // 1024
+            private_kib = int(memory["Private"]) // 1024
+            commit_kib = int(memory["Commit"]) // 1024
+        else:
+            st = Path(f"/proc/{pid}/status").read_text()
+            values = dict((ln.split()[0].rstrip(":"), int(ln.split()[1]))
+                          for ln in st.splitlines() if len(ln.split()) >= 2)
+            working_set_kib = values.get("VmRSS", -1)
+            private_kib = values.get("RssAnon", -1)
+            commit_kib = values.get("VmSize", -1)
     except Exception:
         pass
     return {
         "ts": time.time(),
         "gpu_mib": gpu_mib,
         "gpu_util": gpu_util,
-        "rss_kib": rss_kib,
-        "hwm_kib": hwm_kib,
+        "working_set_kib": working_set_kib,
+        "private_kib": private_kib,
+        "commit_kib": commit_kib,
     }
 
 
@@ -140,21 +162,21 @@ class MemSampler(threading.Thread):
         self.interval = interval
         self.stop_ev = threading.Event()
         self.rows: list[dict] = []
-        self.peak = {"gpu_mib": 0, "rss_kib": 0, "hwm_kib": 0}
+        self.peak = {"gpu_mib": 0, "working_set_kib": 0, "private_kib": 0, "commit_kib": 0}
 
     def run(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("w") as fh:
-            fh.write("ts_epoch,gpu_mib,gpu_util,rss_kib,hwm_kib\n")
+            fh.write("ts_epoch,gpu_mib,gpu_util,working_set_kib,private_kib,commit_kib\n")
             while not self.stop_ev.is_set():
                 row = snapshot_mem(self.pid)
                 self.rows.append(row)
-                for k in ("gpu_mib", "rss_kib", "hwm_kib"):
+                for k in ("gpu_mib", "working_set_kib", "private_kib", "commit_kib"):
                     if row[k] > self.peak[k]:
                         self.peak[k] = row[k]
                 fh.write(
                     f"{row['ts']:.6f},{row['gpu_mib']},{row['gpu_util']},"
-                    f"{row['rss_kib']},{row['hwm_kib']}\n"
+                    f"{row['working_set_kib']},{row['private_kib']},{row['commit_kib']}\n"
                 )
                 fh.flush()
                 self.stop_ev.wait(self.interval)
@@ -224,6 +246,9 @@ def main() -> int:
     (ROOT / "logs" / "kvmem_prog_60k_notes.txt").write_text(notes)
 
     env = gpu_env.apply_gpu(os.environ.copy(), "27b")
+    global GPU_UUID, GPU_NAME
+    GPU_UUID = env["CUDA_VISIBLE_DEVICES"]
+    GPU_NAME = env["KVMEM_GPU_NAME"]
     env["KVMEM_TRACE"] = "1"
     log_tag = args.log_tag or ("mtp" if args.spec_type == "draft-mtp" else "")
     stem = "tools_60k_27b" + (f"_{log_tag}" if log_tag else "")
@@ -261,7 +286,7 @@ def main() -> int:
             time.sleep(0.5)
         else:
             raise SystemExit("server did not print listening line:\n" + log_path.read_text()[-4000:])
-        gpu_env.require_device(log_path.read_text(), "RTX 5090")
+        gpu_env.require_device(log_path.read_text(), GPU_NAME)
         print(f"server up in {time.time() - t0:.1f}s  idle_mem={snapshot_mem(proc.pid)}", flush=True)
 
         t1_user = (
@@ -313,7 +338,7 @@ def main() -> int:
                 f"n_past={info['n_past']} n_new={info['n_new']} query={info['query']} "
                 f"prefill_ms={info['prefill_ms']:.0f} gen_n={info['gen_n']} "
                 f"gen_toks={info['gen_toks']:.2f} retr_ms={info['retrieval_ms']:.1f} "
-                f"gpu={info['mem']['gpu_mib']}MiB rss={info['mem']['rss_kib']/1024:.0f}MiB "
+                f"gpu={info['mem']['gpu_mib']}MiB working_set={info['mem']['working_set_kib']/1024:.0f}MiB "
                 f"finish={info['finish_reason']}{mtp_s}",
                 flush=True,
             )
@@ -383,8 +408,9 @@ def main() -> int:
         peak = sampler.peak
         lines = [
             f"model={args.model.name}",
-            f"device=RTX 5090  recipe=-c 65536 budget=20000 gen_reserve=10000 bt=128 b=512 q8_0 spec={args.spec_type} n_max={args.spec_draft_n_max}",
-            f"PEAK gpu_mib={peak['gpu_mib']} rss_mib={peak['rss_kib']/1024:.1f} hwm_mib={peak['hwm_kib']/1024:.1f}",
+            f"device={GPU_NAME}  recipe=-c 65536 budget=20000 gen_reserve=10000 bt=128 b=512 q8_0 spec={args.spec_type} n_max={args.spec_draft_n_max}",
+            f"PEAK gpu_mib={peak['gpu_mib']} working_set_mib={peak['working_set_kib']/1024:.1f} "
+            f"private_mib={peak['private_kib']/1024:.1f} commit_mib={peak['commit_kib']/1024:.1f}",
             "",
         ]
         for t in turns:
@@ -400,7 +426,7 @@ def main() -> int:
                 f"prefill_ms={t['prefill_ms']:.1f} gen_n={t['gen_n']} gen_ms={t['gen_ms']:.1f} "
                 f"decode={t['gen_toks']:.2f} tok/s retr_ms={t['retrieval_ms']:.1f} "
                 f"finish={t.get('finish_reason')} gpu_mib={t['mem']['gpu_mib']} "
-                f"rss_mib={t['mem']['rss_kib']/1024:.1f}{mtp_s}"
+                f"working_set_mib={t['mem']['working_set_kib']/1024:.1f}{mtp_s}"
             )
             if t.get("tool_calls"):
                 fn = (t["tool_calls"][0].get("function") or {})

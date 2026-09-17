@@ -4,7 +4,7 @@
 
 llama.cpp inference with tiered KV memory for long-running agents.
 
-**KVMem** adds a bounded GPU KV working set, host-memory storage and query-based retrieval to [llama.cpp](https://github.com/ggml-org/llama.cpp). llama.cpp handles model loading, inference, quantization and MTP. The separate `llama-kvmem-server` provides OpenAI-compatible chat, tools and optional vision. **NVMe offload is not implemented.**
+**KVMem** adds a bounded GPU KV working set, host-memory storage, NVMe offload and query-based retrieval to [llama.cpp](https://github.com/ggml-org/llama.cpp). llama.cpp handles model loading, inference, quantization and MTP. The separate `llama-kvmem-server` provides OpenAI-compatible chat, tools and optional vision.
 
 This port supports **Qwen3.8-27B GGUF quants**, including IQ3 and IQ4. The sibling [kvmem-qw3](https://github.com/kvmem/kvmem-qw3) is a CUDA-native runtime focused on Q8, primarily tested on RTX PRO 6000.
 
@@ -53,11 +53,16 @@ Do **not** commit a dirty `llama.cpp` working tree. The submodule pointer is the
 - RTX 5060 Ti with 16 GiB VRAM; Intel Core Ultra 7 255H and 32 GiB RAM (19.53 GiB visible to WSL2).
 - CMake 4.4.3 and CUDA 13.2.86.
 
+The native Windows target profile is Windows 11 x64 with MSVC 19.51, an RTX
+5070 Ti (16 GiB), about 48 GiB system RAM and the NVMe cache on drive I:. The
+Windows profile uses IQ3/MTP3, a 256K context, CPU vision and a 64 GiB shared
+NVMe budget by default; IQ4 and GPU vision remain selectable.
+
 The project builds on llama.cpp's CUDA backend, with the platform above used for our measurements. Reports of successful runs, benchmarks and issues on other NVIDIA GPUs and systems are welcome. AMD/ROCm and Metal backends would need integration work.
 
 ## Clone, patch, build
 
-Building uses a C++17 compiler, CMake and **CUDA Toolkit 13.2 Update 2 (nvcc 13.2.86) or newer**. The startup scripts use Python 3.10+ and `ss` (iproute2).
+Building uses a C++17 compiler, CMake and **CUDA Toolkit 13.2 Update 2 (nvcc 13.2.86) or newer**. The startup scripts use Python 3.10+. Linux uses `ss` (iproute2); native Windows uses PowerShell and `netstat`.
 
 **CUDA compiler version matters for correctness.** The validated baseline is nvcc **13.2.86** on Linux/WSL2 and native Windows. A Windows build made with nvcc 13.2.51 produced garbage output from Qwen3.8-27B IQ3_S even with KVMem and MTP disabled; rebuilding unchanged source with 13.2.86 restored correct output. A successful build, health check or small Q8 model test does not validate IQ3 inference. Newer toolchains still need correctness testing before release.
 
@@ -76,7 +81,27 @@ The submodule is ggml-org/llama.cpp at pin `b81c99b`. `scripts/apply-patches.sh`
 
 `scripts/build-cuda.sh` sets `GGML_CUDA_FA_ALL_QUANTS=ON` (needed for `--kv-dtype q5_0` on hybrid models). Binaries: `build/bin/llama-kvmem-server`.
 
-The build script defaults to `CMAKE_CUDA_ARCHITECTURES=120a-real` for the tested RTX 5060 Ti. For another GPU, set `CMAKE_CUDA_ARCHITECTURES` to its appropriate target when running the script; other GPU targets have not been tested here.
+On native Windows 11, use PowerShell from a Visual Studio developer environment
+(MSVC 19.51). The verified local package was built with CUDA 13.4.59; the
+13.2.86 baseline above remains the conservative correctness reference. If
+`CUDA_PATH`/`CUDACXX` is unset, `build-windows.ps1` detects the newest
+installation under `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v*`:
+
+```powershell
+scripts\build-windows.ps1 -HostOnly   # fast compile/test path
+scripts\build-windows.ps1             # CUDA build (CMAKE_CUDA_ARCHITECTURES defaults to 120a-real)
+scripts\start-iq3.ps1 --dry-run       # IQ3/MTP3/ReplaySSM, CPU vision by default
+scripts\package-windows.ps1
+scripts\download-test-models.ps1 mtp
+```
+
+Set `MODEL`, `MMPROJ`, `BUILD_DIR` and `PORT` to override the Windows defaults. The Windows package contains the executables, runtime DLLs, scripts, licenses, build manifest and SHA-256 sums; model files remain separate.
+
+The build script defaults to `CMAKE_CUDA_ARCHITECTURES=120a-real` for the tested RTX 5070 Ti. For another GPU, set `CMAKE_CUDA_ARCHITECTURES` to its appropriate target when running the script; other GPU targets have not been tested here.
+
+### Windows-Dashboard
+
+Nach dem Entpacken genügt ein Doppelklick auf `Start.bat`. Das lokale Dashboard öffnet sich automatisch im Standardbrowser und bietet Modellauswahl, IQ3/IQ4, Vision, GPU, Kontext, KVMem/MTP, Retrieval, NVMe-Budget sowie Start, Neustart, Vorschau und Stop. GGUF-Dateien werden aus `models` und `I:\models` eingelesen; eigene Verzeichnisse können über `KVMEM_MODEL_DIRS` (unter Windows mit `;` getrennt) gesetzt werden. Das Dashboard bindet ausschließlich an `127.0.0.1`.
 
 ## Browser chat
 
@@ -119,7 +144,7 @@ CUDA_VISIBLE_DEVICES=0 MODEL=/path/model.gguf scripts/start-iq4.sh
 scripts/start-iq4.sh --dry-run
 ```
 
-GPU selection honors `CUDA_VISIBLE_DEVICES`; otherwise it chooses a 5060 Ti or the only GPU. Ambiguous multi-GPU setups require an explicit selection. `MODEL`, `MMPROJ`, `MMPROJ_DEVICE` and `PORT` can override recipe defaults. MTP3 and ReplaySSM are server defaults; override with `SPEC_DRAFT_N_MAX` and `KVMEM_MTP_STATE` if needed. CUDA libraries come from the build directory, caller environment or the toolkit recorded during compilation; use `CUDA_HOME` or `LD_LIBRARY_PATH` for a custom installation. An existing matching service is reused; switching configuration requires `--restart`, which only stops this project's server.
+GPU selection honors `CUDA_VISIBLE_DEVICES`; native Windows otherwise prefers the RTX 5070 Ti, then the RTX 5060 Ti, and finally the largest available GPU. Ambiguous multi-GPU setups require an explicit selection. `MODEL`, `MMPROJ`, `MMPROJ_DEVICE` and `PORT` can override recipe defaults. MTP3 and ReplaySSM are server defaults; override with `SPEC_DRAFT_N_MAX` and `KVMEM_MTP_STATE` if needed. CUDA libraries come from the build directory, caller environment or the toolkit recorded during compilation; use `CUDA_HOME` or `LD_LIBRARY_PATH` for a custom installation. An existing matching service is reused; switching configuration requires `--restart`, which only stops this project's server.
 
 ### Thinking and chat templates
 

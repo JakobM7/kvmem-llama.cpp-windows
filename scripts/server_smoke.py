@@ -21,9 +21,8 @@ NEEDLE = "The secret code is BLUEBIRD-42."
 
 
 def find_server() -> Path:
-    for p in (ROOT / "build/bin/llama-kvmem-server", ROOT / "build/llama-kvmem-server"):
-        if p.is_file():
-            return p
+    if p := gpu_env.find_binary("llama-kvmem-server"):
+        return p
     raise SystemExit("llama-kvmem-server not found; run scripts/build-cuda.sh")
 
 
@@ -110,7 +109,7 @@ def main() -> int:
         else:
             raise SystemExit("server did not print listening line:\n" + log_path.read_text()[-4000:])
         wait_health(base)
-        gpu_env.require_device(log_path.read_text(), "RTX 5050")
+        gpu_env.require_device(log_path.read_text(), env["KVMEM_GPU_NAME"])
 
         st, body = post_json(base + "/v1/chat/completions", {
             "messages": [{"role": "user", "content": "Say hi in one word."}],

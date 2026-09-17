@@ -309,7 +309,7 @@ static kvmem::KvMemRuntimeConfig make_runtime_cfg(
         if (g_kvmem_params.nvme_dir && g_kvmem_params.nvme_dir[0]) {
             cfg.nvme_dir = g_kvmem_params.nvme_dir;
         } else if (cfg.nvme_bytes > 0) {
-            cfg.nvme_dir = "/tmp/kvmem_nvme";
+            cfg.nvme_dir = llama_kvmem_default_nvme_dir();
         }
     }
     return cfg;
@@ -563,14 +563,32 @@ llama_memory_kvmem::llama_memory_kvmem(
         rcfg.v_gpu_row_bytes = ggml_row_size(type_v_, n_embd_v_);
     }
     if (g_kvmem_params.raw_k_nvme) {
-        rcfg.nvme_bytes = g_kvmem_params.nvme_bytes
+        const uint64_t total_nvme = g_kvmem_params.nvme_bytes
                 ? g_kvmem_params.nvme_bytes
                 : (32ull * 1024ull * 1024ull * 1024ull);
+        rcfg.nvme_bytes = total_nvme;
+        // Reserve the MTP share up front. The MTP context is created after
+        // this target, so use an F16 worst-case estimate for its slot width;
+        // the follower recomputes its exact share and can only use less.
+        if (model.hparams.n_layer_nextn > 0) {
+            kvmem::RawKvStoreConfig mtp_est = rcfg;
+            mtp_est.n_layer = std::max(1u, model.hparams.n_layer_nextn);
+            mtp_est.n_embd_k = model.hparams.n_embd_k_gqa(model.hparams.n_layer());
+            mtp_est.n_embd_v = model.hparams.n_embd_v_gqa(model.hparams.n_layer());
+            mtp_est.k_row_bytes = 0;
+            mtp_est.k_gpu_row_bytes = mtp_est.n_embd_k * sizeof(uint16_t);
+            mtp_est.v_gpu_row_bytes = v_trans_ ? 0 : mtp_est.n_embd_v * sizeof(uint16_t);
+            rcfg.nvme_bytes = llama_kvmem_nvme_share(
+                    total_nvme,
+                    llama_kvmem_raw_nvme_layout_weight(rcfg),
+                    llama_kvmem_raw_nvme_layout_weight(mtp_est));
+        }
         rcfg.nvme_dir = (g_kvmem_params.nvme_dir && g_kvmem_params.nvme_dir[0])
                 ? g_kvmem_params.nvme_dir
-                : "/tmp/kvmem_nvme";
+                : llama_kvmem_default_nvme_dir();
         rcfg.nvme_file = "kvmem_raw_k.bin";
     }
+    nvme_layout_weight_ = llama_kvmem_raw_nvme_layout_weight(rcfg);
     raw_ = std::make_unique<kvmem::RawKvStore>(rcfg);
     q_sum_.assign(n_layer_, std::vector<float>(n_head_ * n_embd_head_, 0.0f));
     q_count_.assign(n_layer_, 0);

@@ -9,11 +9,14 @@ from pathlib import Path
 import re
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mtp_canary import find_mtp_model
+import gpu_env
 
 ROOT = Path(__file__).resolve().parents[1]
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -31,15 +34,14 @@ def post(base, body):
 
 
 def main():
-    binary = ROOT / 'build/bin/llama-kvmem-server'
+    binary = gpu_env.find_binary('llama-kvmem-server')
+    if binary is None:
+        raise SystemExit('llama-kvmem-server not found; run the Windows or CUDA build')
     model = find_mtp_model()
     folder = ROOT / 'logs' / ('chat_sampling_' + time.strftime('%Y%m%d_%H%M%S'))
     folder.mkdir()
     print('ARTIFACTS', folder, flush=True)
-    env = os.environ.copy()
-    env['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-    env['CUDA_VISIBLE_DEVICES'] = 'GPU-14f08a8c-8d62-4338-8ae4-c669889cdb29'
-    env['LD_LIBRARY_PATH'] = str(ROOT / 'build/bin') + ':/home/leye/kvmem_qw3/.cu13-env/lib'
+    env = gpu_env.apply_gpu(os.environ.copy(), 'small')
     results = []
     for mode in ('none', 'draft-mtp'):
         with socket.socket() as sock:

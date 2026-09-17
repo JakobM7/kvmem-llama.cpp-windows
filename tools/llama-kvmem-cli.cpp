@@ -41,7 +41,7 @@ static void print_usage(const char * argv0) {
             "  --kvmem-gpu-low R          prefill offload low watermark (default 0.85)\n"
             "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
             "  --kvmem-nvme-gb GB         NVMe spill file in GiB (0 = off)\n"
-            "  --kvmem-nvme-dir PATH      NVMe spill directory (default /tmp/kvmem_nvme)\n"
+            "  --kvmem-nvme-dir PATH      NVMe spill directory (default KVMEM_NVME_DIR, or cache/nvme on Windows)\n"
             "  --kvmem-harvest-v          prefill D2H V with raw-K (default off; RAM until NVMe flush)\n"
             "  --kvmem-raw-k-nvme         store raw-K and V on NVMe (needs --kvmem-nvme-gb)\n"
             "  --kvmem-dump-kv            after prefill, compare raw-rebuild KV vs GPU KV\n"
@@ -293,7 +293,11 @@ int main(int argc, char ** argv) {
             kparams.nvme_dir = nvme_dir.c_str();
         }
         if (dump_kv) {
+#if defined(_WIN32)
+            _putenv_s("KVMEM_DUMP_CAPTURE", "1");
+#else
             setenv("KVMEM_DUMP_CAPTURE", "1", 1);
+#endif
         }
         if (query_last > 0 && n_prompt > 0) {
             const int last = std::min(query_last, n_prompt);

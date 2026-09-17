@@ -13,9 +13,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fcntl.h>
 #include <memory>
 #include <limits>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -24,11 +28,26 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#endif
 
 namespace kvmem {
+
+#if defined(_WIN32)
+using NvmeNativeHandle = HANDLE;
+inline NvmeNativeHandle kNvmeInvalidHandle = INVALID_HANDLE_VALUE;
+#else
+using NvmeNativeHandle = int;
+inline constexpr NvmeNativeHandle kNvmeInvalidHandle = -1;
+#endif
 
 struct NvmeKvTierConfig {
     std::string dir;
@@ -109,11 +128,66 @@ public:
 
         ensure_dir(cfg_.dir);
         if (cfg_.file_name.empty() ||
-            cfg_.file_name.find('/') != std::string::npos) {
+            cfg_.file_name.find('/') != std::string::npos ||
+            cfg_.file_name.find('\\') != std::string::npos) {
             throw std::runtime_error(
                 "NVMe KV tier file_name must be a non-empty basename");
         }
         path_ = cfg_.dir + "/" + cfg_.file_name;
+#if defined(_WIN32)
+        io_alignment_ = windows_sector_size(path_);
+        fd_ = open_windows(path_, cfg_.read_only, cfg_.durable, false);
+        if (fd_ == kNvmeInvalidHandle) {
+            throw std::runtime_error(
+                "failed to open NVMe KV tier file: " + path_ + ": " +
+                windows_error(GetLastError()));
+        }
+        if (cfg_.direct_read && cfg_.durable && cfg_.read_only) {
+            direct_fd_ = open_windows(path_, true, true, true, true);
+            if (direct_fd_ == kNvmeInvalidHandle) {
+                std::fprintf(
+                    stderr,
+                    "[kvmem-io] direct_read_degraded=1 path=%s "
+                    "error=windows message=%s action=buffered-fallback\n",
+                    path_.c_str(), windows_error(GetLastError()).c_str());
+            } else {
+                std::fprintf(
+                    stderr,
+                    "[kvmem-io] direct_read=1 path=%s alignment=%llu\n",
+                    path_.c_str(),
+                    static_cast<unsigned long long>(io_alignment_));
+            }
+        }
+        if (cfg_.preallocate && !cfg_.read_only && cfg_.total_bytes > 0) {
+            if (cfg_.total_bytes > static_cast<uint64_t>(INT64_MAX) ||
+                !preallocate_windows(fd_, cfg_.total_bytes)) {
+                const DWORD error = GetLastError();
+                close_handle(fd_);
+                fd_ = kNvmeInvalidHandle;
+                throw std::runtime_error(
+                    "failed to preallocate NVMe KV tier file: " + path_ +
+                    ": " + windows_error(error));
+            }
+            std::fprintf(stderr,
+                         "[kvmem-io] preallocated path=%s bytes=%llu\n",
+                         path_.c_str(),
+                         static_cast<unsigned long long>(cfg_.total_bytes));
+        }
+        if (!cfg_.read_only) {
+            // Keep the normal descriptor for short/unaligned writes. The
+            // no-buffering descriptor is only used for complete aligned
+            // sectors, so Windows never receives an invalid direct-I/O range.
+            write_direct_fd_ = open_windows(
+                path_, false, true, true, true);
+            if (write_direct_fd_ == kNvmeInvalidHandle) {
+                std::fprintf(
+                    stderr,
+                    "[kvmem-io] direct_write_degraded=1 path=%s "
+                    "message=%s action=buffered-fallback\n",
+                    path_.c_str(), windows_error(GetLastError()).c_str());
+            }
+        }
+#else
         int flags = O_CLOEXEC;
         if (cfg_.read_only) {
             flags |= O_RDONLY;
@@ -211,6 +285,7 @@ public:
                     ": " + std::strerror(unlink_error));
             }
         }
+#endif
         if (cfg_.read_only && !cfg_.overlay_dir.empty()) open_overlay();
         if (cfg_.direct_mapped) return;
         free_slots_.reserve(slot_count_);
@@ -224,20 +299,21 @@ public:
     NvmeKvTier &operator=(const NvmeKvTier &) = delete;
 
     ~NvmeKvTier() {
-        if (direct_fd_ >= 0) ::close(direct_fd_);
-        if (fd_ >= 0) ::close(fd_);
-        if (overlay_fd_ >= 0) ::close(overlay_fd_);
+        close_handle(direct_fd_);
+        close_handle(write_direct_fd_);
+        close_handle(fd_);
+        close_handle(overlay_fd_);
     }
 
-    bool enabled() const { return fd_ >= 0 && slot_count_ > 0; }
+    bool enabled() const { return fd_ != kNvmeInvalidHandle && slot_count_ > 0; }
     uint32_t slot_count() const { return slot_count_; }
     uint64_t slot_bytes() const { return cfg_.slot_bytes; }
     const std::string &path() const { return path_; }
     bool drops_page_cache() const { return cfg_.drop_page_cache; }
     bool direct_mapped() const { return cfg_.direct_mapped; }
-    bool read_only() const { return cfg_.read_only && overlay_fd_ < 0; }
-    bool has_overlay() const { return overlay_fd_ >= 0; }
-    bool direct_reads() const { return direct_fd_ >= 0; }
+    bool read_only() const { return cfg_.read_only && overlay_fd_ == kNvmeInvalidHandle; }
+    bool has_overlay() const { return overlay_fd_ != kNvmeInvalidHandle; }
+    bool direct_reads() const { return direct_fd_ != kNvmeInvalidHandle; }
 
     // Declare block ids [begin,end) resident at their identity slots. Only
     // meaningful for a direct-mapped arena, where an attached archive knows
@@ -369,7 +445,7 @@ public:
         validate_slot_range_io(
             slot, slot_byte_offset, data, bytes, "write");
         const uint64_t offset = slot_offset(slot) + slot_byte_offset;
-        if (overlay_fd_ >= 0) {
+        if (handle_valid(overlay_fd_)) {
             write_overlay_slot_range(slot, slot_byte_offset, data, bytes);
             if (cfg_.drop_page_cache) {
                 (void) drop_cached_range(
@@ -377,9 +453,26 @@ public:
             }
             return;
         }
-        const int fd = write_fd();
+        const NvmeNativeHandle fd = write_fd();
+#if defined(_WIN32)
+        bool direct = false;
+#endif
+#if defined(_WIN32)
+        if (handle_valid(write_direct_fd_) &&
+            offset % io_alignment_ == 0 && bytes % io_alignment_ == 0) {
+            pwrite_unbuffered(write_direct_fd_, data, bytes, offset);
+            direct = true;
+        } else {
+            pwrite_all(fd, data, bytes, offset);
+        }
+#else
         pwrite_all(fd, data, bytes, offset);
-        if (cfg_.drop_page_cache) {
+#endif
+        if (cfg_.drop_page_cache
+#if defined(_WIN32)
+            && !direct
+#endif
+        ) {
             (void) drop_cached_range(fd, offset, bytes, /*write=*/true);
         }
     }
@@ -393,7 +486,7 @@ public:
         validate_slot_range_io(
             slot, slot_byte_offset, data, bytes, "read");
         const uint64_t offset = slot_offset(slot) + slot_byte_offset;
-        const int fd = read_fd_for_range(slot, data, bytes, offset);
+        const NvmeNativeHandle fd = read_fd_for_range(slot, data, bytes, offset);
         pread_all(fd, data, bytes, offset);
         if (cfg_.drop_page_cache && fd != direct_fd_) {
             (void) drop_cached_range(fd, offset, bytes, /*write=*/false);
@@ -418,7 +511,139 @@ public:
     }
 
 private:
+#if defined(_WIN32)
+    static bool handle_valid(NvmeNativeHandle handle) {
+        return handle != kNvmeInvalidHandle && handle != nullptr;
+    }
+
+    static void close_handle(NvmeNativeHandle &handle) {
+        if (handle_valid(handle)) CloseHandle(handle);
+        handle = kNvmeInvalidHandle;
+    }
+
+    static std::wstring utf8_to_wide(const std::string &value) {
+        if (value.empty()) return {};
+        const int length = MultiByteToWideChar(
+            CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+            static_cast<int>(value.size()), nullptr, 0);
+        if (length <= 0) {
+            throw std::runtime_error("invalid UTF-8 path: " + value);
+        }
+        std::wstring out(static_cast<size_t>(length), L'\0');
+        if (MultiByteToWideChar(
+                CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                static_cast<int>(value.size()), out.data(), length) != length) {
+            throw std::runtime_error("failed to convert UTF-8 path: " + value);
+        }
+        return out;
+    }
+
+    static std::string windows_error(DWORD error) {
+        if (error == ERROR_SUCCESS) return "unknown Windows error";
+        LPWSTR message = nullptr;
+        const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                             FORMAT_MESSAGE_FROM_SYSTEM |
+                             FORMAT_MESSAGE_IGNORE_INSERTS;
+        const DWORD length = FormatMessageW(
+            flags, nullptr, error, 0, reinterpret_cast<LPWSTR>(&message), 0,
+            nullptr);
+        std::string out = "error " + std::to_string(error);
+        if (length > 0 && message) {
+            int utf8_length = WideCharToMultiByte(
+                CP_UTF8, 0, message, static_cast<int>(length), nullptr, 0,
+                nullptr, nullptr);
+            if (utf8_length > 0) {
+                std::string text(static_cast<size_t>(utf8_length), '\0');
+                WideCharToMultiByte(
+                    CP_UTF8, 0, message, static_cast<int>(length), text.data(),
+                    utf8_length, nullptr, nullptr);
+                while (!text.empty() &&
+                       (text.back() == '\r' || text.back() == '\n')) {
+                    text.pop_back();
+                }
+                out += ": " + text;
+            }
+        }
+        if (message) LocalFree(message);
+        return out;
+    }
+
+    static NvmeNativeHandle open_windows(const std::string &path,
+                                         bool read_only, bool durable,
+                                         bool no_buffering,
+                                         bool existing = false) {
+        const bool delete_on_close = !durable && !existing;
+        const DWORD access = (read_only ? GENERIC_READ :
+                              (GENERIC_READ | GENERIC_WRITE)) |
+                             (delete_on_close ? DELETE : 0);
+        const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        DWORD disposition = existing || read_only ? OPEN_EXISTING : OPEN_ALWAYS;
+        if (!durable && !read_only && !existing) disposition = CREATE_ALWAYS;
+        DWORD flags = FILE_ATTRIBUTE_NORMAL;
+        // Every positional operation supplies its own OVERLAPPED offset. The
+        // handle must therefore be opened for overlapped I/O; GetOverlappedResult
+        // below turns the single-request operations into synchronous calls.
+        flags |= FILE_FLAG_OVERLAPPED;
+        if (no_buffering) flags |= FILE_FLAG_NO_BUFFERING;
+        if (delete_on_close) flags |= FILE_FLAG_DELETE_ON_CLOSE;
+        return CreateFileW(
+            utf8_to_wide(path).c_str(), access, share, nullptr, disposition,
+            flags, nullptr);
+    }
+
+    static bool preallocate_windows(NvmeNativeHandle handle, uint64_t bytes) {
+        LARGE_INTEGER size{};
+        size.QuadPart = static_cast<LONGLONG>(bytes);
+        if (!SetFilePointerEx(handle, size, nullptr, FILE_BEGIN)) return false;
+        return SetEndOfFile(handle) != FALSE;
+    }
+
+    static uint64_t windows_sector_size(const std::string &path) {
+        std::wstring wide_path = utf8_to_wide(path);
+        std::wstring volume(32768, L'\0');
+        DWORD volume_length = static_cast<DWORD>(volume.size());
+        if (!GetVolumePathNameW(wide_path.c_str(), volume.data(),
+                                volume_length)) {
+            return kDirectAlignment;
+        }
+        DWORD sectors_per_cluster = 0;
+        DWORD bytes_per_sector = 0;
+        DWORD free_clusters = 0;
+        DWORD total_clusters = 0;
+        if (!GetDiskFreeSpaceW(volume.c_str(), &sectors_per_cluster,
+                               &bytes_per_sector, &free_clusters,
+                               &total_clusters) ||
+            bytes_per_sector < 512) {
+            return kDirectAlignment;
+        }
+        return bytes_per_sector;
+    }
+#else
+    static bool handle_valid(NvmeNativeHandle handle) { return handle >= 0; }
+
+    static void close_handle(NvmeNativeHandle &handle) {
+        if (handle >= 0) ::close(handle);
+        handle = kNvmeInvalidHandle;
+    }
+#endif
+
     static void ensure_dir(const std::string &dir) {
+#if defined(_WIN32)
+        std::error_code ec;
+        const std::filesystem::path path(utf8_to_wide(dir));
+        if (std::filesystem::exists(path, ec)) {
+            if (ec || !std::filesystem::is_directory(path, ec)) {
+                throw std::runtime_error(
+                    "NVMe KV tier path is not a directory: " + dir);
+            }
+            return;
+        }
+        if (!std::filesystem::create_directories(path, ec) && ec) {
+            throw std::runtime_error(
+                "failed to create NVMe KV tier directory: " + dir + ": " +
+                ec.message());
+        }
+#else
         struct stat st {};
         if (stat(dir.c_str(), &st) == 0) {
             if ((st.st_mode & S_IFDIR) == 0) {
@@ -431,6 +656,7 @@ private:
             throw std::runtime_error(
                 "failed to create NVMe KV tier directory: " + dir);
         }
+#endif
     }
 
     void validate_io(const void *data, uint64_t bytes,
@@ -496,30 +722,42 @@ private:
     void open_overlay() {
         ensure_dir(cfg_.overlay_dir);
         if (cfg_.overlay_file_name.empty() ||
-            cfg_.overlay_file_name.find('/') != std::string::npos) {
+            cfg_.overlay_file_name.find('/') != std::string::npos ||
+            cfg_.overlay_file_name.find('\\') != std::string::npos) {
             throw std::runtime_error(
                 "NVMe KV tier overlay_file_name must be a non-empty basename");
         }
         const std::string overlay_path =
             cfg_.overlay_dir + "/" + cfg_.overlay_file_name;
+#if defined(_WIN32)
+        overlay_fd_ = open_windows(overlay_path, false, false, false);
+#else
         overlay_fd_ = ::open(overlay_path.c_str(),
                              O_CLOEXEC | O_CREAT | O_RDWR | O_TRUNC, 0644);
-        if (overlay_fd_ < 0) {
+#endif
+        if (!handle_valid(overlay_fd_)) {
             throw std::runtime_error(
                 "failed to open NVMe KV tier overlay file: " + overlay_path +
-                ": " + std::strerror(errno));
+                ": " +
+#if defined(_WIN32)
+                windows_error(GetLastError())
+#else
+                std::strerror(errno)
+#endif
+            );
         }
         // Same rationale as the ephemeral arena: the overlay is scratch that
         // must not outlive the process, and the file stays sparse so it costs
         // only the slots the session actually diverges on.
+#if !defined(_WIN32)
         if (::unlink(overlay_path.c_str()) != 0) {
             const int unlink_error = errno;
-            ::close(overlay_fd_);
-            overlay_fd_ = -1;
+            close_handle(overlay_fd_);
             throw std::runtime_error(
                 "failed to make NVMe KV tier overlay ephemeral: " +
                 overlay_path + ": " + std::strerror(unlink_error));
         }
+#endif
         overlay_valid_ = std::unique_ptr<std::atomic<uint8_t>[]>(
             new std::atomic<uint8_t>[slot_count_]);
         for (uint32_t i = 0; i < slot_count_; ++i) {
@@ -527,10 +765,12 @@ private:
         }
     }
 
-    int write_fd() const { return overlay_fd_ >= 0 ? overlay_fd_ : fd_; }
+    NvmeNativeHandle write_fd() const {
+        return handle_valid(overlay_fd_) ? overlay_fd_ : fd_;
+    }
 
-    int read_fd(int32_t slot) const {
-        if (overlay_fd_ < 0) return fd_;
+    NvmeNativeHandle read_fd(int32_t slot) const {
+        if (!handle_valid(overlay_fd_)) return fd_;
         uint8_t state = overlay_valid_[slot].load(std::memory_order_acquire);
         while (state == kOverlayInitializing) {
             std::this_thread::yield();
@@ -593,8 +833,37 @@ private:
                    slot_offset(slot) + slot_byte_offset);
     }
 
-    void pwrite_all(int fd, const void *data, uint64_t bytes,
+    void pwrite_all(NvmeNativeHandle fd, const void *data, uint64_t bytes,
                     uint64_t offset) const {
+#if defined(_WIN32)
+        const uint8_t *src = static_cast<const uint8_t *>(data);
+        uint64_t done = 0;
+        const uint64_t max_chunk =
+            (static_cast<uint64_t>(std::numeric_limits<DWORD>::max()) /
+             io_alignment_) * io_alignment_;
+        while (done < bytes) {
+            const DWORD chunk = static_cast<DWORD>(std::min<uint64_t>(
+                bytes - done,
+                max_chunk));
+            OVERLAPPED overlapped{};
+            const uint64_t position = offset + done;
+            overlapped.Offset = static_cast<DWORD>(position);
+            overlapped.OffsetHigh = static_cast<DWORD>(position >> 32);
+            DWORD transferred = 0;
+            BOOL complete = WriteFile(
+                fd, src + done, chunk, &transferred, &overlapped);
+            if (!complete && GetLastError() == ERROR_IO_PENDING) {
+                complete = GetOverlappedResult(
+                    fd, &overlapped, &transferred, TRUE);
+            }
+            if (!complete || transferred == 0) {
+                throw std::runtime_error(
+                    "NVMe positional write failed: " +
+                    windows_error(GetLastError()));
+            }
+            done += transferred;
+        }
+#else
         const uint8_t *src = static_cast<const uint8_t *>(data);
         uint64_t done = 0;
         while (done < bytes) {
@@ -609,10 +878,75 @@ private:
             }
             done += static_cast<uint64_t>(n);
         }
+#endif
     }
 
-    void pread_all(int fd, void *data, uint64_t bytes,
+#if defined(_WIN32)
+    void pwrite_unbuffered(NvmeNativeHandle fd, const void *data,
+                           uint64_t bytes, uint64_t offset) const {
+        if (bytes == 0) return;
+        const uintptr_t address = reinterpret_cast<uintptr_t>(data);
+        if (address % io_alignment_ == 0) {
+            pwrite_all(fd, data, bytes, offset);
+            return;
+        }
+        if (bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            // This is not expected for a KV slot, but the buffered descriptor
+            // is the only safe fallback when an aligned staging allocation
+            // cannot be represented by the host size type.
+            pwrite_all(write_fd(), data, bytes, offset);
+            return;
+        }
+        void *staging = _aligned_malloc(
+            static_cast<size_t>(bytes), static_cast<size_t>(io_alignment_));
+        if (!staging) {
+            pwrite_all(write_fd(), data, bytes, offset);
+            return;
+        }
+        std::memcpy(staging, data, static_cast<size_t>(bytes));
+        try {
+            pwrite_all(fd, staging, bytes, offset);
+        } catch (...) {
+            _aligned_free(staging);
+            throw;
+        }
+        _aligned_free(staging);
+    }
+#endif
+
+    void pread_all(NvmeNativeHandle fd, void *data, uint64_t bytes,
                    uint64_t offset) const {
+#if defined(_WIN32)
+        uint8_t *dst = static_cast<uint8_t *>(data);
+        uint64_t done = 0;
+        const uint64_t max_chunk =
+            fd == direct_fd_
+                ? (static_cast<uint64_t>(std::numeric_limits<DWORD>::max()) /
+                   io_alignment_) * io_alignment_
+                : static_cast<uint64_t>(std::numeric_limits<DWORD>::max());
+        while (done < bytes) {
+            const DWORD chunk = static_cast<DWORD>(std::min<uint64_t>(
+                bytes - done,
+                max_chunk));
+            OVERLAPPED overlapped{};
+            const uint64_t position = offset + done;
+            overlapped.Offset = static_cast<DWORD>(position);
+            overlapped.OffsetHigh = static_cast<DWORD>(position >> 32);
+            DWORD transferred = 0;
+            BOOL complete = ReadFile(
+                fd, dst + done, chunk, &transferred, &overlapped);
+            if (!complete && GetLastError() == ERROR_IO_PENDING) {
+                complete = GetOverlappedResult(
+                    fd, &overlapped, &transferred, TRUE);
+            }
+            if (!complete || transferred == 0) {
+                throw std::runtime_error(
+                    "NVMe positional read failed or reached unwritten data: " +
+                    windows_error(GetLastError()));
+            }
+            done += transferred;
+        }
+#else
         uint8_t *dst = static_cast<uint8_t *>(data);
         uint64_t done = 0;
         while (done < bytes) {
@@ -626,6 +960,7 @@ private:
             }
             done += static_cast<uint64_t>(n);
         }
+#endif
     }
 
     void run_spans(const std::vector<NvmeIoSpan> &spans, void *buffer,
@@ -639,7 +974,7 @@ private:
         // shorter than the physical record. Overlay traffic is only the live
         // suffix of an attached archive; retain coalescing for the much larger
         // immutable-base read path below.
-        if (write && overlay_fd_ >= 0) {
+        if (write && handle_valid(overlay_fd_)) {
             for (const NvmeIoSpan &span : spans) {
                 if (span.buffer_offset + span.bytes > buffer_bytes) {
                     throw std::runtime_error(
@@ -663,7 +998,7 @@ private:
                 throw std::runtime_error("NVMe batch span exceeds buffer");
             }
             const uint64_t first_file_offset = slot_offset(first.slot);
-            const int fd = write
+            const NvmeNativeHandle fd = write
                 ? write_fd()
                 : read_fd_for_range(
                       first.slot, base + first.buffer_offset,
@@ -698,14 +1033,36 @@ private:
                 merged_bytes += next.bytes;
                 ++j;
             }
+#if defined(_WIN32)
+            bool direct = false;
+#endif
             if (write) {
+#if defined(_WIN32)
+                const uint64_t file_offset = slot_offset(first.slot);
+                if (handle_valid(write_direct_fd_) &&
+                    file_offset % io_alignment_ == 0 &&
+                    merged_bytes % io_alignment_ == 0) {
+                    pwrite_unbuffered(
+                        write_direct_fd_, base + first.buffer_offset,
+                        merged_bytes, file_offset);
+                    direct = true;
+                } else {
+                    pwrite_all(fd, base + first.buffer_offset, merged_bytes,
+                               file_offset);
+                }
+#else
                 pwrite_all(fd, base + first.buffer_offset, merged_bytes,
                            slot_offset(first.slot));
+#endif
             } else {
                 pread_all(fd, base + first.buffer_offset, merged_bytes,
                           slot_offset(first.slot));
             }
-            if (cfg_.drop_page_cache && fd != direct_fd_) {
+            if (cfg_.drop_page_cache && fd != direct_fd_
+#if defined(_WIN32)
+                && !direct
+#endif
+            ) {
                 const uint64_t file_offset = slot_offset(first.slot);
                 const bool dropped =
                     drop_cached_range(fd, file_offset, merged_bytes, write);
@@ -727,16 +1084,16 @@ private:
 
     bool direct_range_eligible(const void *data, uint64_t bytes,
                                uint64_t offset) const {
-        if (direct_fd_ < 0 || !data || bytes == 0) return false;
+        if (!handle_valid(direct_fd_) || !data || bytes == 0) return false;
         const uintptr_t address = reinterpret_cast<uintptr_t>(data);
-        return address % kDirectAlignment == 0 &&
-               bytes % kDirectAlignment == 0 &&
-               offset % kDirectAlignment == 0;
+        return address % io_alignment_ == 0 &&
+               bytes % io_alignment_ == 0 &&
+               offset % io_alignment_ == 0;
     }
 
-    int read_fd_for_range(int32_t slot, const void *data, uint64_t bytes,
-                          uint64_t offset) const {
-        const int ordinary = read_fd(slot);
+    NvmeNativeHandle read_fd_for_range(int32_t slot, const void *data,
+                                       uint64_t bytes, uint64_t offset) const {
+        const NvmeNativeHandle ordinary = read_fd(slot);
         // Overlay records must always use their own buffered descriptor. The
         // immutable base can use O_DIRECT only for aligned transfer slabs.
         if (ordinary == fd_ && direct_range_eligible(data, bytes, offset)) {
@@ -745,8 +1102,18 @@ private:
         return ordinary;
     }
 
-    bool drop_cached_range(int fd, uint64_t offset, uint64_t bytes,
+    bool drop_cached_range(NvmeNativeHandle fd, uint64_t offset, uint64_t bytes,
                            bool write) const {
+#if defined(_WIN32)
+        (void) offset;
+        (void) bytes;
+        if (write && !FlushFileBuffers(fd)) {
+            warn_cache_drop_failure("flush-file-buffers", GetLastError());
+        } else {
+            warn_cache_drop_failure("windows-cache-drop-unavailable", ERROR_NOT_SUPPORTED);
+        }
+        return false;
+#else
         if (bytes == 0) return true;
         if (write) {
 #if defined(__linux__) && defined(SYNC_FILE_RANGE_WRITE) && \
@@ -793,6 +1160,7 @@ private:
         warn_cache_drop_failure("posix-fadvise-unavailable", ENOTSUP);
         return false;
 #endif
+#endif
     }
 
     void warn_cache_drop_failure(const char *phase, int error) const {
@@ -800,11 +1168,16 @@ private:
         if (!cache_drop_warned_.compare_exchange_strong(expected, true)) {
             return;
         }
+#if defined(_WIN32)
+        const std::string message = windows_error(static_cast<DWORD>(error));
+#else
+        const std::string message = std::strerror(error);
+#endif
         std::fprintf(
             stderr,
             "[kvmem-io] page_cache_drop_degraded=1 phase=%s error=%d "
             "message=%s action=continue-with-kernel-page-cache\n",
-            phase, error, std::strerror(error));
+            phase, error, message.c_str());
     }
 
     void touch_locked(uint32_t block_id) {
@@ -827,11 +1200,13 @@ private:
 
     NvmeKvTierConfig cfg_;
     static constexpr uint64_t kDirectAlignment = 4096;
+    uint64_t io_alignment_ = kDirectAlignment;
     uint32_t slot_count_ = 0;
     std::string path_;
-    int fd_ = -1;
-    int direct_fd_ = -1;
-    int overlay_fd_ = -1;
+    NvmeNativeHandle fd_ = kNvmeInvalidHandle;
+    NvmeNativeHandle direct_fd_ = kNvmeInvalidHandle;
+    NvmeNativeHandle write_direct_fd_ = kNvmeInvalidHandle;
+    NvmeNativeHandle overlay_fd_ = kNvmeInvalidHandle;
     static constexpr uint8_t kOverlayBase = 0;
     static constexpr uint8_t kOverlayInitializing = 1;
     static constexpr uint8_t kOverlayValid = 2;

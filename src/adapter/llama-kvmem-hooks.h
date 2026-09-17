@@ -117,8 +117,24 @@ LLAMA_API void llama_kvmem_dump_kv_writeback(struct llama_context * ctx, int32_t
 #ifdef __cplusplus
 }
 
+#include <cstdlib>
 #include <vector>
 #include <string>
+
+// Direct CLI/server use must not inherit the Linux-only /tmp fallback on
+// Windows. The launcher sets KVMEM_NVME_DIR explicitly, but this keeps the
+// adapter safe for every entry point.
+static inline const char * llama_kvmem_default_nvme_dir() {
+    const char * configured = std::getenv("KVMEM_NVME_DIR");
+    if (configured && configured[0]) {
+        return configured;
+    }
+#if defined(_WIN32)
+    return "cache/nvme";
+#else
+    return "/tmp/kvmem_nvme";
+#endif
+}
 
 struct llama_kvmem_row_range {
     int32_t begin = 0;

@@ -8,10 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <future>
+#include <filesystem>
 #include <string>
 #include <vector>
-
-#include <unistd.h>
 
 using namespace kvmem;
 
@@ -24,9 +23,8 @@ static int g_fail = 0;
 } while (0)
 
 static std::string temp_dir() {
-    const char *base = std::getenv("TMPDIR");
-    if (!base) base = "/tmp";
-    return std::string(base) + "/qw3_nvme_kv_tier_test";
+    return (std::filesystem::temp_directory_path() /
+            "qw3_nvme_kv_tier_test").string();
 }
 
 static void test_disabled() {
@@ -51,7 +49,11 @@ static void test_write_read_release() {
     CHECK(t.slot_count() == 4);
     // The open descriptor remains usable, but the cache has no directory
     // entry and therefore cannot survive process exit as a stale large file.
-    CHECK(::access(t.path().c_str(), F_OK) != 0);
+#if defined(_WIN32)
+    CHECK(std::filesystem::exists(t.path()));
+#else
+    CHECK(!std::filesystem::exists(t.path()));
+#endif
 
     std::vector<uint8_t> a(64), b(64), out(64);
     for (size_t i = 0; i < a.size(); ++i) {
@@ -82,7 +84,11 @@ static void test_slot_ranges_and_file_names() {
     NvmeKvTier t(cfg);
     CHECK(t.enabled());
     CHECK(t.path().find(cfg.file_name) != std::string::npos);
-    CHECK(::access(t.path().c_str(), F_OK) != 0);
+#if defined(_WIN32)
+    CHECK(std::filesystem::exists(t.path()));
+#else
+    CHECK(!std::filesystem::exists(t.path()));
+#endif
 
     const auto p = t.place_block(7);
     CHECK(p.slot == 0);
@@ -153,15 +159,25 @@ static void test_coalesced_batch_io() {
     t.write_spans(spans, input.data(), input.size(), &writes);
     CHECK(writes.bytes == input.size());
     CHECK(writes.syscalls == 1);
+#if defined(_WIN32)
+    CHECK(writes.cache_drop_bytes == 0);
+    CHECK(writes.cache_drop_failures == 1);
+#else
     CHECK(writes.cache_drop_bytes == input.size());
     CHECK(writes.cache_drop_failures == 0);
+#endif
 
     NvmeBatchIoStats reads;
     t.read_spans(spans, output.data(), output.size(), &reads);
     CHECK(reads.bytes == output.size());
     CHECK(reads.syscalls == 1);
+#if defined(_WIN32)
+    CHECK(reads.cache_drop_bytes == 0);
+    CHECK(reads.cache_drop_failures == 1);
+#else
     CHECK(reads.cache_drop_bytes == output.size());
     CHECK(reads.cache_drop_failures == 0);
+#endif
     CHECK(output == input);
 }
 
@@ -209,6 +225,23 @@ static void test_concurrent_positional_batches() {
             static_cast<std::ptrdiff_t>(a.size())));
 }
 
+static void test_large_offsets() {
+#if defined(_WIN32)
+    NvmeKvTierConfig cfg;
+    cfg.dir = temp_dir();
+    cfg.file_name = "qw3_nvme_4g_offset_test.bin";
+    cfg.slot_bytes = 4096;
+    cfg.total_bytes = (1ull << 32) + 2 * cfg.slot_bytes;
+    cfg.direct_mapped = true;
+    NvmeKvTier t(cfg);
+    const uint32_t block = static_cast<uint32_t>(cfg.total_bytes / cfg.slot_bytes - 1);
+    std::vector<uint8_t> input(cfg.slot_bytes, 0xA7), output(cfg.slot_bytes, 0);
+    t.write_block(block, input.data(), input.size());
+    t.read_block(block, output.data(), output.size());
+    CHECK(output == input);
+#endif
+}
+
 int main() {
     test_disabled();
     test_write_read_release();
@@ -216,6 +249,7 @@ int main() {
     test_evicting_place();
     test_coalesced_batch_io();
     test_concurrent_positional_batches();
+    test_large_offsets();
 
     if (g_fail != 0) {
         std::printf("FAILED: %d check(s)\n", g_fail);

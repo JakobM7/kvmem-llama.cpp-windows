@@ -21,12 +21,8 @@ DEFAULT_MODEL = ROOT / "models/unsloth/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
 
 
 def find_cli() -> Path:
-    for p in (
-        ROOT / "build/bin/llama-kvmem-cli",
-        ROOT / "build/llama-kvmem-cli",
-    ):
-        if p.is_file():
-            return p
+    if p := gpu_env.find_binary("llama-kvmem-cli"):
+        return p
     raise SystemExit("llama-kvmem-cli not found")
 
 
@@ -59,7 +55,7 @@ def run(cli: Path, model: Path, ntok: int, ctx: int, nvme_dir: str) -> dict:
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr[-8000:])
         raise SystemExit(f"decode failed rc={proc.returncode}")
-    gpu_env.require_device(proc.stderr, "RTX 5050")
+    gpu_env.require_device(proc.stderr, env["KVMEM_GPU_NAME"])
     info = {
         "n_prompt": None,
         "cells": None,

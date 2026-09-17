@@ -18,12 +18,15 @@ import signal
 import socket
 import statistics
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gpu_env
+
 ROOT = Path(__file__).resolve().parents[1]
-GPU = 'GPU-5847813c-9e6e-bb43-cc5e-621aac091b6c'
 URL = 'http://127.0.0.1:18201'
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -103,6 +106,29 @@ def stop_server(proc):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=10)
+
+
+def process_cmdline(pid):
+    if os.name != 'nt':
+        return Path(f'/proc/{pid}/cmdline').read_bytes().decode().strip('\0').split('\0')
+    result = subprocess.run(
+        ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+         f'$p=Get-CimInstance Win32_Process -Filter "ProcessId = {int(pid)}"; '
+         'if ($p) { $p.CommandLine }'],
+        check=True, capture_output=True, text=True, timeout=10)
+    commandline = result.stdout.strip()
+    if not commandline:
+        raise FileNotFoundError(pid)
+    import shlex
+    return [part.strip('"') for part in shlex.split(commandline, posix=False)]
+
+
+def stop_owned_pid(pid):
+    if os.name == 'nt':
+        subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'],
+                       check=True, capture_output=True, text=True)
+    else:
+        os.kill(pid, signal.SIGTERM)
 
 
 def trial(folder, dtype, argv, request_bytes, env, nvml, device):
@@ -211,8 +237,11 @@ def main():
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 18201))
     old_pid = int((ROOT / 'logs/iq4_18200.pid').read_text())
-    old_argv = Path(f'/proc/{old_pid}/cmdline').read_bytes().decode().strip('\0').split('\0')
-    assert old_argv[0] == str(ROOT / 'build/bin/llama-kvmem-server'), 'unexpected default server process'
+    old_argv = process_cmdline(old_pid)
+    expected_name = 'llama-kvmem-server.exe' if os.name == 'nt' else 'llama-kvmem-server'
+    actual_server = Path(old_argv[0]).resolve()
+    assert actual_server.name.casefold() == expected_name.casefold() and actual_server.is_relative_to(ROOT.resolve()), \
+        'unexpected default server process'
     expected = {'--port': '18200', '--kv-dtype': 'q5_0', '--kvmem-budget': '32000',
                 '--kvmem-gen-reserve': '12000', '--spec-draft-n-max': '2', '-b': '512', '-c': '262144'}
     for flag, value in expected.items():
@@ -223,21 +252,19 @@ def main():
     (root / 'request.json').write_bytes(request_bytes)
     shutil.copy2(__file__, root / 'benchmark.py')
     print('ARTIFACTS', root, flush=True)
-    env = os.environ.copy()
-    env.update(CUDA_DEVICE_ORDER='PCI_BUS_ID', CUDA_VISIBLE_DEVICES=GPU,
-               PATH='/usr/bin:/bin:/usr/lib/wsl/lib:/home/leye/kvmem_qw3/.cu13-env/bin',
-               LD_LIBRARY_PATH=str(ROOT / 'build/bin') + ':/home/leye/kvmem_qw3/.cu13-env/lib')
+    env = gpu_env.apply_gpu(os.environ.copy(), '27b')
     for key in ('KVMEM_TRACE', 'KVMEM_PERF'):
         env.pop(key, None)
-    nvml = ctypes.CDLL('libnvidia-ml.so.1')
+    nvml = ctypes.CDLL('nvml.dll' if os.name == 'nt' else 'libnvidia-ml.so.1')
     assert nvml.nvmlInit_v2() == 0
     device = ctypes.c_void_p()
-    assert nvml.nvmlDeviceGetHandleByUUID(GPU.encode(), ctypes.byref(device)) == 0
-    summary = {'default_argv': old_argv, 'gpu_uuid': GPU, 'rounds': args.rounds,
+    gpu_uuid = env['CUDA_VISIBLE_DEVICES']
+    assert nvml.nvmlDeviceGetHandleByUUID(gpu_uuid.encode(), ctypes.byref(device)) == 0
+    summary = {'default_argv': old_argv, 'gpu_uuid': gpu_uuid, 'rounds': args.rounds,
                'server_sha256': hashlib.sha256(Path(old_argv[0]).read_bytes()).hexdigest(), 'trials': []}
     stopped = False
     try:
-        os.kill(old_pid, signal.SIGTERM)
+        stop_owned_pid(old_pid)
         stopped = True
         order = [t for r in range(args.rounds) for t in
                  (('f16', 'q8_0', 'q5_0') if r % 2 == 0 else ('q5_0', 'q8_0', 'f16'))]
@@ -265,8 +292,11 @@ def main():
     finally:
         nvml.nvmlShutdown()
         if stopped:
-            restore = subprocess.run(['bash', str(ROOT / 'scripts/start-iq4.sh')],
-                                     cwd=ROOT, env=env, capture_output=True, text=True, timeout=90)
+            restore_script = ROOT / 'scripts' / ('start-iq4.ps1' if os.name == 'nt' else 'start-iq4.sh')
+            restore_cmd = (['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(restore_script)]
+                           if os.name == 'nt' else ['bash', str(restore_script)])
+            restore = subprocess.run(restore_cmd, cwd=ROOT, env=env,
+                                     capture_output=True, text=True, timeout=90)
             (root / 'restore.log').write_text(restore.stdout + restore.stderr)
             summary['restore_rc'] = restore.returncode
             print('RESTORE', restore.returncode, restore.stdout.strip(), flush=True)

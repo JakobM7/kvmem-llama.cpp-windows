@@ -4,8 +4,8 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <filesystem>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 using namespace kvmem;
@@ -164,9 +164,8 @@ static void test_cpu_full_spills_to_nvme_and_roundtrips() {
         }
     };
 
-    const char *base = std::getenv("TMPDIR");
-    if (!base) base = "/tmp";
-    const std::string dir = std::string(base) + "/kvmem_p32_nvme";
+    const std::string dir =
+        (std::filesystem::temp_directory_path() / "kvmem_p32_nvme").string();
 
     MemoryBackend be;
     KvMemRuntimeConfig cfg = make_cfg();

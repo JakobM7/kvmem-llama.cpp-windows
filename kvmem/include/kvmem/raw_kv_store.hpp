@@ -55,7 +55,7 @@ public:
     void write_layer_k_rows(uint32_t pos0, uint32_t n, uint32_t il,
                             const uint8_t * k, const float * k_f32);
     void write_layer_v_gpu(uint32_t pos0, uint32_t n, uint32_t il, const uint8_t * v);
-    // Packed GPU-format K (RoPE+Hadamard+quant already applied). RAM only.
+    // Packed GPU-format K (RoPE+Hadamard+quant already applied).
     void write_layer_k_gpu(uint32_t pos0, uint32_t n, uint32_t il, const uint8_t * k);
     // Prefill mean-K only (no raw-K rows). k is token-major F32, n_embd_k per token.
     void write_layer_mean_k(uint32_t pos0, uint32_t n, uint32_t il, const float * k);
@@ -110,27 +110,38 @@ private:
         bool k_gpu_fmt = false;
         bool v_gpu_fmt = false;
         bool k_flushing = false;
+        bool k_gpu_on_nvme = false;
+        bool k_gpu_flushing = false;
         bool v_flushing = false;
     };
     struct BlockRaw {
         std::vector<LayerBlk> layers;
     };
 
-    uint32_t nvme_key(uint32_t block_id, uint32_t il, bool is_v) const;
+    enum class IoKind : uint8_t { raw_k, packed_k, v };
+    uint32_t nvme_key(uint32_t block_id, uint32_t il, IoKind kind) const;
     uint64_t k_row_bytes() const;
     uint64_t k_slot_bytes() const;
     uint64_t v_slot_bytes() const;
     uint64_t v_gpu_slot_bytes() const;
     bool k_is_f16() const;
-    void maybe_flush_k(uint32_t block_id, uint32_t il);
-    void maybe_flush_v(uint32_t block_id, uint32_t il);
+    void maybe_flush_k(uint32_t block_id, uint32_t il,
+                       std::unique_lock<std::mutex> & lock);
+    void maybe_flush_k_gpu(uint32_t block_id, uint32_t il,
+                           std::unique_lock<std::mutex> & lock);
+    void maybe_flush_v(uint32_t block_id, uint32_t il,
+                       std::unique_lock<std::mutex> & lock);
     void capture_mean_f16(LayerBlk & lb) const;
     void add_mean_f32(LayerBlk & lb, uint32_t off, uint32_t take, const float * k);
     bool load_k_nvme(uint32_t block_id, uint32_t il, uint8_t * dst) const;
+    bool load_k_gpu_nvme(uint32_t block_id, uint32_t il, uint8_t * dst) const;
     bool load_v_nvme(uint32_t block_id, uint32_t il, uint16_t * dst) const;
     bool load_v_gpu_nvme(uint32_t block_id, uint32_t il, uint8_t * dst) const;
     void enqueue_flush(uint32_t key, std::vector<uint8_t> && data, uint64_t bytes,
-                       uint32_t block_id, uint32_t il, bool is_v);
+                       uint32_t block_id, uint32_t il, IoKind kind,
+                       std::unique_lock<std::mutex> & lock);
+    void throw_io_error_locked() const;
+    void release_nvme_keys(uint32_t block_id, uint32_t il);
     void io_loop();
     bool io_sync_inline() const;
 
@@ -138,7 +149,7 @@ private:
         uint32_t key = 0;
         uint32_t block_id = 0;
         uint32_t il = 0;
-        bool is_v = false;
+        IoKind kind = IoKind::raw_k;
         uint64_t bytes = 0;
         std::vector<uint8_t> data;
     };
@@ -156,6 +167,8 @@ private:
     mutable std::condition_variable cv_;
     std::vector<IoJob> q_;
     size_t inflight_ = 0;
+    uint64_t pending_bytes_ = 0;
+    std::string io_error_;
     std::thread io_thread_;
     std::atomic<bool> stop_io_{false};
 };

@@ -12,7 +12,12 @@ add_subdirectory(kvmem)
 
 option(KVMEM_BUILD_LLAMA "Build llama.cpp with the KVMem adapter" ON)
 if (KVMEM_BUILD_LLAMA)
-    if (NOT CMAKE_CUDA_COMPILER AND EXISTS "/home/leye/kvmem_qw3/.cu13-env/bin/nvcc")
+    if (NOT CMAKE_CUDA_COMPILER AND DEFINED ENV{CUDACXX})
+        set(CMAKE_CUDA_COMPILER "$ENV{CUDACXX}" CACHE FILEPATH "nvcc")
+    elseif (NOT CMAKE_CUDA_COMPILER AND WIN32 AND DEFINED ENV{CUDA_PATH} AND
+            EXISTS "$ENV{CUDA_PATH}/bin/nvcc.exe")
+        set(CMAKE_CUDA_COMPILER "$ENV{CUDA_PATH}/bin/nvcc.exe" CACHE FILEPATH "nvcc")
+    elseif (NOT CMAKE_CUDA_COMPILER AND EXISTS "/home/leye/kvmem_qw3/.cu13-env/bin/nvcc")
         set(CMAKE_CUDA_COMPILER "/home/leye/kvmem_qw3/.cu13-env/bin/nvcc" CACHE FILEPATH "nvcc")
     endif()
     if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)

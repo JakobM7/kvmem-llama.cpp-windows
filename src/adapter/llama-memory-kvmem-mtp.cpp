@@ -107,15 +107,16 @@ llama_memory_kvmem_mtp::llama_memory_kvmem_mtp(
     }
     const llama_kvmem_params * kp = llama_kvmem_get_params();
     if (kp && kp->raw_k_nvme) {
-        const uint64_t ntok = std::max<uint64_t>(cparams.n_ctx, kv_size_);
-        const uint64_t need =
-                static_cast<uint64_t>(rcfg.n_layer) * ntok *
-                (static_cast<uint64_t>(rcfg.n_embd_k) + rcfg.n_embd_v) *
-                sizeof(uint16_t);
-        rcfg.nvme_bytes = need + 32ull * 1024ull * 1024ull;
+        const uint64_t total_nvme = kp->nvme_bytes
+                ? kp->nvme_bytes
+                : (32ull * 1024ull * 1024ull * 1024ull);
+        rcfg.nvme_bytes = llama_kvmem_nvme_share(
+                total_nvme,
+                llama_kvmem_raw_nvme_layout_weight(rcfg),
+                target_->nvme_layout_weight());
         rcfg.nvme_dir = (kp->nvme_dir && kp->nvme_dir[0])
                 ? kp->nvme_dir
-                : "/tmp/kvmem_nvme";
+                : llama_kvmem_default_nvme_dir();
         rcfg.nvme_file = "kvmem_raw_mtp_k.bin";
     }
     raw_ = std::make_unique<kvmem::RawKvStore>(rcfg);

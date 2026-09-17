@@ -11,14 +11,62 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import sys
 
 PROMPT = 'What is 2+3? Answer with the number only.'
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def find_server() -> Path:
+    name = 'llama-kvmem-server.exe' if os.name == 'nt' else 'llama-kvmem-server'
+    candidates = []
+    if os.environ.get('KVMEM_BUILD_DIR'):
+        base = Path(os.environ['KVMEM_BUILD_DIR'])
+        candidates.extend((base / 'bin' / name, base / name))
+    candidates.extend((ROOT / 'bin' / name, ROOT / 'build' / 'bin' / name,
+                       ROOT / 'build' / name, ROOT / 'build-windows' / 'bin' / name,
+                       ROOT / 'build-windows' / name))
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise SystemExit(f'{name} not found; set KVMEM_BUILD_DIR or package bin/')
+
+
 def swap_kib():
+    if os.name == 'nt':
+        return 0
     info = dict(line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines())
     return int(info['SwapTotal'].split()[0]) - int(info['SwapFree'].split()[0])
+
+
+def process_memory(pid):
+    if os.name != 'nt':
+        try:
+            values = dict(line.split(':', 1) for line in Path(f'/proc/{pid}/status').read_text().splitlines())
+            return {key: int(values[key].split()[0]) for key in ('VmRSS', 'VmSize', 'VmSwap') if key in values}
+        except (FileNotFoundError, ValueError):
+            return {}
+    import ctypes
+    class Counters(ctypes.Structure):
+        _fields_ = [('cb', ctypes.c_ulong), ('page_faults', ctypes.c_ulong),
+                    ('peak_working_set', ctypes.c_size_t), ('working_set', ctypes.c_size_t),
+                    ('peak_paged_pool', ctypes.c_size_t), ('paged_pool', ctypes.c_size_t),
+                    ('peak_nonpaged_pool', ctypes.c_size_t), ('nonpaged_pool', ctypes.c_size_t),
+                    ('pagefile_usage', ctypes.c_size_t), ('peak_pagefile_usage', ctypes.c_size_t),
+                    ('private_usage', ctypes.c_size_t)]
+    handle = ctypes.windll.kernel32.OpenProcess(0x0400 | 0x0010, False, int(pid))
+    if not handle:
+        return {}
+    try:
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        if not ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            return {}
+        return {'WorkingSet': counters.working_set // 1024,
+                'PrivateBytes': counters.private_usage // 1024,
+                'Commit': counters.pagefile_usage // 1024}
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
 
 
 def main():
@@ -35,14 +83,18 @@ def main():
     if not model.is_file() or not 1 <= args.port <= 65536 - len(args.cases):
         ap.error('model must exist and the case ports must fit in 1..65535')
     args.output.mkdir(parents=True, exist_ok=False)
+    server = find_server()
     env = os.environ.copy()
     env['CUDA_VISIBLE_DEVICES'] = args.gpu
-    env['LD_LIBRARY_PATH'] = str(ROOT / 'lib')
+    library_key = 'PATH' if os.name == 'nt' else 'LD_LIBRARY_PATH'
+    env[library_key] = os.pathsep.join(dict.fromkeys(
+        path for path in [str(server.parent), str(ROOT / 'lib'), env.get(library_key, '')] if path))
     op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     payload = {'messages': [{'role': 'user', 'content': PROMPT}], 'temperature': 0, 'max_tokens': 32}
     (args.output / 'request.json').write_text(json.dumps(payload, indent=2) + '\n')
     info = {'gpu': args.gpu, 'model': str(model), 'model_bytes': model.stat().st_size,
-            'os_release': Path('/etc/os-release').read_text(), 'cases': args.cases}
+            'os_release': (sys.platform if os.name == 'nt' else Path('/etc/os-release').read_text()),
+            'cases': args.cases}
     if args.hash_model:
         with model.open('rb') as f:
             info['model_sha256'] = hashlib.file_digest(f, 'sha256').hexdigest() if hasattr(hashlib, 'file_digest') else hash_file(f)
@@ -55,7 +107,7 @@ def main():
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(('127.0.0.1', case_port))
         spec = 'draft-mtp' if case.startswith('mtp-') else 'none'
-        cmd = [str(ROOT / 'bin/llama-kvmem-server'), '-m', str(model), '--host', '127.0.0.1',
+        cmd = [str(server), '-m', str(model), '--host', '127.0.0.1',
                '--port', str(case_port), '-c', '32768', '-n', '32', '-b', '512', '-ngl', '99',
                '--enable-thinking', '--reasoning-budget', '4096', '--spec-type', spec,
                '--spec-draft-n-max', '2', '--spec-kv-dtype', 'f16', '--kvmem-block-tokens', '128',
@@ -74,14 +126,17 @@ def main():
             def monitor():
                 while not done.wait(0.5):
                     try:
-                        lines = Path(f'/proc/{proc.pid}/status').read_text().splitlines()
-                        proc_swap = next(int(l.split()[1]) for l in lines if l.startswith('VmSwap:'))
-                        if proc_swap >= 512 * 1024 or swap_kib() - baseline >= 1024 * 1024:
-                            row['swap_stop'] = True
+                        memory = process_memory(proc.pid)
+                        proc_swap = memory.get('VmSwap', 0)
+                        windows_memory_limit = os.name == 'nt' and memory.get('Commit', 0) >= 48 * 1024 * 1024
+                        if (proc_swap >= 512 * 1024 or swap_kib() - baseline >= 1024 * 1024 or
+                                windows_memory_limit):
+                            row['memory_stop' if os.name == 'nt' else 'swap_stop'] = True
+                            row['memory'] = memory
                             stopped.set()
                             proc.terminate()
                             return
-                    except (FileNotFoundError, StopIteration, ProcessLookupError):
+                    except (FileNotFoundError, StopIteration, ProcessLookupError, OSError):
                         return
             thread = threading.Thread(target=monitor, daemon=True)
             thread.start()

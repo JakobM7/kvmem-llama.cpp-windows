@@ -80,7 +80,7 @@ static void print_usage(const char * argv0) {
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
             "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
             "  --kvmem-nvme-gb GB         NVMe file in GiB (0 = off)\n"
-            "  --kvmem-nvme-dir PATH      NVMe directory (default /tmp/kvmem_nvme)\n"
+            "  --kvmem-nvme-dir PATH      NVMe directory (default KVMEM_NVME_DIR, or cache/nvme on Windows)\n"
             "  --kvmem-harvest-v          prefill D2H V with raw-K (default off; RAM until NVMe flush)\n"
             "  --kvmem-raw-k-nvme         store raw-K and V on NVMe (needs --kvmem-nvme-gb)\n"
             "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | q8_0 | q5_0 | q4_0 (default q8_0)\n"

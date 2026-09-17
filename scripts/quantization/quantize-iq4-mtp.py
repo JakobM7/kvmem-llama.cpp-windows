@@ -6,6 +6,10 @@ import os
 from pathlib import Path
 import runpy
 import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import gpu_env  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 MODELS = ROOT / 'models/unsloth/Qwen3.8-27B-GGUF'
@@ -16,9 +20,13 @@ def main():
     parser.add_argument('--model', type=Path, default=MODELS / 'Qwen3.8-27B-UD-IQ4_XS.gguf')
     parser.add_argument('--output', type=Path, default=MODELS / 'Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf')
     parser.add_argument('--imatrix', type=Path, default=MODELS / 'imatrix_unsloth.gguf')
-    parser.add_argument('--binary', type=Path, default=ROOT / 'build/bin/llama-quantize')
+    parser.add_argument('--binary', type=Path, default=None)
     parser.add_argument('--dry-run', action='store_true', help='Print the command without generating a model')
     args = parser.parse_args()
+    if args.binary is None:
+        args.binary = gpu_env.find_binary('llama-quantize')
+        if args.binary is None:
+            parser.error('llama-quantize not found; set --binary or build the project')
     type_map = Path(__file__).with_name('qwen3.8-27b-iq4-xs-mtp-q4_0.types')
     for path in (args.model, args.imatrix, args.binary, type_map):
         if not path.is_file():
@@ -32,9 +40,10 @@ def main():
            str(args.model.resolve()), str(args.output.resolve()), 'IQ4_XS']
     env = os.environ.copy()
     launcher = runpy.run_path(str(ROOT / 'scripts/start-server.py'))
-    env['LD_LIBRARY_PATH'] = launcher['library_path'](args.binary.resolve(), env)
+    library_key = 'PATH' if os.name == 'nt' else 'LD_LIBRARY_PATH'
+    env[library_key] = launcher['library_path'](args.binary.resolve(), env)
     if args.dry_run:
-        print(json.dumps({'argv': cmd, 'LD_LIBRARY_PATH': env['LD_LIBRARY_PATH']}, indent=2))
+        print(json.dumps({'argv': cmd, library_key: env[library_key]}, indent=2))
         return 0
     args.output.parent.mkdir(parents=True, exist_ok=True)
     return subprocess.run(cmd, env=env).returncode

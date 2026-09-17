@@ -8,6 +8,7 @@
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/rope.hpp"
 
+#include <algorithm>
 #include <condition_variable>
 #include <array>
 #include <cstdint>
@@ -22,6 +23,31 @@ struct llama_memory_params;
 struct ggml_tensor;
 class llama_memory_recurrent;
 class llama_memory_kvmem_mtp;
+
+// NVMe uses one fixed-size slot for every raw/packed layer item. Keep the
+// Main/MTP split based on that actual slot footprint instead of a 50/50 guess.
+static inline uint64_t llama_kvmem_raw_nvme_layout_weight(const kvmem::RawKvStoreConfig & cfg) {
+    const uint64_t k_row = cfg.k_row_bytes
+            ? cfg.k_row_bytes
+            : static_cast<uint64_t>(cfg.n_embd_k) * sizeof(uint16_t);
+    uint64_t slot = std::max(static_cast<uint64_t>(cfg.block_tokens) * k_row,
+            static_cast<uint64_t>(cfg.block_tokens) * cfg.n_embd_v * sizeof(uint16_t));
+    slot = std::max(slot,
+            static_cast<uint64_t>(cfg.block_tokens) * cfg.k_gpu_row_bytes);
+    slot = std::max(slot,
+            static_cast<uint64_t>(cfg.block_tokens) * cfg.v_gpu_row_bytes);
+    return slot * std::max(1u, cfg.n_layer);
+}
+
+static inline uint64_t llama_kvmem_nvme_share(uint64_t total,
+                                               uint64_t own_weight,
+                                               uint64_t peer_weight) {
+    if (total == 0 || peer_weight == 0) {
+        return total;
+    }
+    const uint64_t sum = own_weight + peer_weight;
+    return sum == 0 ? total : (total / sum) * own_weight + (total % sum) * own_weight / sum;
+}
 
 // Bounded block-slot pool over a llama_kv_cache.
 //
@@ -179,6 +205,7 @@ public:
     uint32_t n_embd_v() const { return n_embd_v_; }
 
     kvmem::RawKvStore & raw() { return *raw_; }
+    uint64_t nvme_layout_weight() const { return nvme_layout_weight_; }
 
 private:
     friend struct kvmem_transfer_test_access;
@@ -346,6 +373,7 @@ private:
     SlotBackend backend_;
     std::unique_ptr<kvmem::KvMemRuntime> runtime_;
     std::unique_ptr<kvmem::RawKvStore> raw_;
+    uint64_t nvme_layout_weight_ = 0;
     std::vector<int32_t> free_slots_;
     struct RowPosition {
         std::array<llama_pos, 4> pos{};

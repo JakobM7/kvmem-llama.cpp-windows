@@ -7,7 +7,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <string>
 #include <vector>
+
+static std::string test_temp_dir(const char *name) {
+    return (std::filesystem::temp_directory_path() / name).string();
+}
 
 #define CHECK(cond)                                                            \
     do {                                                                       \
@@ -167,7 +173,7 @@ int main() {
     CHECK(hgot[0] == 0.0f);
 
     kvmem::RawKvStoreConfig ncfg = cfg;
-    ncfg.nvme_dir = "/tmp/kvmem_raw_k_test";
+    ncfg.nvme_dir = test_temp_dir("kvmem_raw_k_test");
     ncfg.nvme_file = "raw.bin";
     ncfg.nvme_bytes = 4ull * 1024ull * 1024ull;
     kvmem::RawKvStore rawn(ncfg);
@@ -275,7 +281,7 @@ int main() {
 
     kvmem::RawKvStoreConfig ngcfg = cfg;
     ngcfg.v_gpu_row_bytes = 6;
-    ngcfg.nvme_dir = "/tmp/kvmem_raw_vgpu_test";
+    ngcfg.nvme_dir = test_temp_dir("kvmem_raw_vgpu_test");
     ngcfg.nvme_file = "raw_vgpu.bin";
     ngcfg.nvme_bytes = 4ull * 1024ull * 1024ull;
     kvmem::RawKvStore rawgn(ngcfg);
@@ -308,7 +314,7 @@ int main() {
 
     kvmem::RawKvStoreConfig nkcfg = cfg;
     nkcfg.k_row_bytes = 6;
-    nkcfg.nvme_dir = "/tmp/kvmem_raw_krow_test";
+    nkcfg.nvme_dir = test_temp_dir("kvmem_raw_krow_test");
     nkcfg.nvme_file = "raw_krow.bin";
     nkcfg.nvme_bytes = 4ull * 1024ull * 1024ull;
     kvmem::RawKvStore rawkn(nkcfg);
