@@ -158,6 +158,15 @@ $env:ENABLE_FOLLOW_UP_GENERATION = 'false'
 $env:ENABLE_AUTOCOMPLETE_GENERATION = 'false'
 $env:ENABLE_SEARCH_QUERY_GENERATION = 'false'
 $env:ENABLE_RETRIEVAL_QUERY_GENERATION = 'false'
+# Open WebUI forwards these model defaults to llama.cpp.  Only an explicit
+# dashboard thinking profile enables them; the normal "off" profile stays
+# unchanged and does not add reasoning work to chat requests.
+$reasoningBudget = $env:KVMEM_OPENWEBUI_THINKING
+if ($reasoningBudget -in @('256', '1024', '4096')) {
+    $env:DEFAULT_MODEL_PARAMS = '{"chat_template_kwargs":{"enable_thinking":true},"reasoning_budget_tokens":' + $reasoningBudget + '}'
+} else {
+    Remove-Item Env:DEFAULT_MODEL_PARAMS -ErrorAction SilentlyContinue
+}
 $defaultModel = if ([string]::IsNullOrWhiteSpace($env:KVMEM_OPENWEBUI_DEFAULT_MODEL)) {
     $preferred = Get-ChildItem -Path @((Join-Path $Root 'models'), 'I:\models\LLM_Collection\qwen3.8') -Recurse -Filter '*.gguf' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '(?i)qwen3\.8.*ud-iq4.*mtp|ud-iq4.*mtp.*qwen3\.8' } |

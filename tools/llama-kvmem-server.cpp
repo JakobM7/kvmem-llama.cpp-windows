@@ -2074,21 +2074,35 @@ int main(int argc, char ** argv) {
         }
 
         auto timings = std::make_shared<json>(json::object());
-        auto make_emit_gen_wall = [timings, n_prompt = (int) toks.size()](
+        auto make_emit_gen_wall = [timings, n_prompt = (int) toks.size(),
+                                   context_limit = (int) llama_n_ctx(st.ctx)](
                 std::chrono::steady_clock::time_point t_turn0,
                 std::chrono::steady_clock::time_point t_pf1,
                 double prefill_ms) {
-            return [timings, t_turn0, t_pf1, prefill_ms, n_prompt](int n_gen) {
+            return [timings, t_turn0, t_pf1, prefill_ms, n_prompt, context_limit](int n_gen) {
                 const auto now = std::chrono::steady_clock::now();
                 const double gen_ms = std::chrono::duration<double, std::milli>(now - t_pf1).count();
-                *timings = {{"predicted_n", n_gen}, {"predicted_ms", gen_ms}};
                 const double wall_ms = std::chrono::duration<double, std::milli>(now - t_turn0).count();
-                const double tps = gen_ms > 0.0 ? 1000.0 * (double) n_gen / gen_ms : 0.0;
-                fprintf(stderr, "KVMEM_GEN_WALL n=%d ms=%.2f toks=%.2f\n", n_gen, gen_ms, tps);
+                const double prefill_tps = prefill_ms > 0.0 ? 1000.0 * (double) n_prompt / prefill_ms : 0.0;
+                const double decode_tps = gen_ms > 0.0 ? 1000.0 * (double) n_gen / gen_ms : 0.0;
+                const double total_tps = wall_ms > 0.0 ? 1000.0 * (double) (n_prompt + n_gen) / wall_ms : 0.0;
+                *timings = {
+                    {"prompt_n", n_prompt},
+                    {"prompt_ms", prefill_ms},
+                    {"prompt_per_second", prefill_tps},
+                    {"predicted_n", n_gen},
+                    {"predicted_ms", gen_ms},
+                    {"predicted_per_second", decode_tps},
+                    {"total_ms", wall_ms},
+                    {"total_per_second", total_tps},
+                    {"context_tokens", n_prompt + n_gen},
+                    {"context_limit", context_limit},
+                };
+                fprintf(stderr, "KVMEM_GEN_WALL n=%d ms=%.2f toks=%.2f\n", n_gen, gen_ms, decode_tps);
                 fprintf(stderr,
                         "KVMEM_CHAT_TURN n_prompt=%d n_gen=%d prefill_ms=%.2f gen_ms=%.2f "
                         "wall_ms=%.2f gen_toks=%.2f\n",
-                        n_prompt, n_gen, prefill_ms, gen_ms, wall_ms, tps);
+                        n_prompt, n_gen, prefill_ms, gen_ms, wall_ms, decode_tps);
             };
         };
 

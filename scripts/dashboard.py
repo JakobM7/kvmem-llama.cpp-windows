@@ -148,14 +148,22 @@ def gpu_list():
 
 def tail_logs(limit=12000):
     files = sorted((path for path in (ROOT / "logs").glob("*.log")
-                    if "open-webui" not in path.name.lower() and "kvmem" in path.name.lower()),
+                    if "open-webui" not in path.name.lower()
+                    and "kvmem" in path.name.lower()
+                    and path.name.lower().endswith(".stderr.log")),
                    key=lambda path: path.stat().st_mtime, reverse=True) if (ROOT / "logs").is_dir() else []
     chunks = []
     # Show only the newest KVMem log; older recipe logs can contain stale
     # requests and make a healthy current server look stuck.
     for path in files[:1]:
         try:
-            chunks.append(f"--- {path.name} ---\n{path.read_text(encoding='utf-8', errors='replace')[-4000:]}")
+            lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+            graph_reuses = sum("CUDA Graph id" in line and "reused" in line for line in lines)
+            lines = [line for line in lines if not ("CUDA Graph id" in line and "reused" in line)]
+            if graph_reuses:
+                lines.append(f"INFO: CUDA-Graph-Wiederverwendung ({graph_reuses}x) – normal, kein Fehler")
+            visible = "\n".join(lines)
+            chunks.append(f"--- {path.name} ---\n{visible[-4000:]}")
         except OSError:
             pass
     return "\n".join(chunks)[-limit:]
@@ -231,11 +239,14 @@ def nvme_snapshot(path):
 
 
 def log_activity():
-    files = sorted((path for path in (ROOT / "logs").glob("*.log") if "open-webui" not in path.name.lower()),
+    files = sorted((path for path in (ROOT / "logs").glob("*.stderr.log*")
+                    if "open-webui" not in path.name.lower()
+                    and "kvmem" in path.name.lower()
+                    and ".stderr.log" in path.name.lower()),
                    key=lambda path: path.stat().st_mtime, reverse=True) if (ROOT / "logs").is_dir() else []
     if not files:
         return {"stage": "unbekannt", "age_seconds": None, "event": "Noch kein Server-Log vorhanden."}
-    path = files[0]
+    path = next((candidate for candidate in files if candidate.name.lower().endswith(".stderr.log")), files[0])
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
         lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -256,10 +267,56 @@ def log_activity():
         else:
             stage = "Server arbeitet"
         metrics = {}
+        chat_turn = None
+        # A fresh restart log has no completed request yet. Keep the newest
+        # completed measurement from the current or a few rotated KVMem logs.
+        for metric_path in files[:5]:
+            try:
+                metric_lines = [line.strip() for line in metric_path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+            except OSError:
+                continue
+            for line in reversed(metric_lines):
+                match = re.search(r"KVMEM_CHAT_TURN\s+n_prompt=(\d+)\s+n_gen=(\d+)\s+prefill_ms=([\d.]+)\s+gen_ms=([\d.]+)\s+wall_ms=([\d.]+)\s+gen_toks=([\d.]+)", line)
+                if match:
+                    prompt_tokens, generated_tokens = int(match.group(1)), int(match.group(2))
+                    prefill_ms, decode_ms, total_ms = (float(match.group(i)) for i in (3, 4, 5))
+                    metrics = {
+                        "prompt_tokens": prompt_tokens, "generated_tokens": generated_tokens,
+                        "context_tokens": prompt_tokens + generated_tokens,
+                        "prefill_ms": prefill_ms, "decode_ms": decode_ms, "total_ms": total_ms,
+                        "prefill_toks": round(prompt_tokens / (prefill_ms / 1000), 2) if prefill_ms > 0 else 0,
+                        "decode_toks": float(match.group(6)),
+                        "total_toks": round((prompt_tokens + generated_tokens) / (total_ms / 1000), 2) if total_ms > 0 else 0,
+                        "metrics_file": metric_path.name,
+                    }
+                    chat_turn = True
+                    break
+            if chat_turn:
+                for line in reversed(metric_lines):
+                    match = re.search(r"KVMEM_TRACE\s+cache_commit\s+n_prompt=(\d+)\s+n_gen=(\d+)\s+n_cached=(\d+)", line)
+                    if match:
+                        metrics["cached_tokens"] = int(match.group(3))
+                        metrics["context_tokens"] = int(match.group(3))
+                        break
+                for line in reversed(metric_lines):
+                    match = re.search(r"\bspec_stats\b.*?accept_pct=([\d.]+)", line)
+                    if match:
+                        metrics["mtp_accept_pct"] = float(match.group(1))
+                        break
+                break
+            # Keep compatibility with older logs which predate KVMEM_CHAT_TURN.
+            for line in reversed(metric_lines):
+                match = re.search(r"KVMEM_GEN_WALL\s+n=(\d+)\s+ms=([\d.]+)\s+toks=([\d.]+)", line)
+                if match:
+                    metrics.update({"generated_tokens": int(match.group(1)), "decode_ms": float(match.group(2)), "decode_toks": float(match.group(3)), "metrics_file": metric_path.name})
+                    chat_turn = True
+                    break
+            if chat_turn:
+                break
         for line in reversed(lines):
-            match = re.search(r"KVMEM_GEN_WALL\s+n=(\d+)\s+ms=([\d.]+)\s+toks=([\d.]+)", line)
+            match = re.search(r"\bspec=(off|draft-mtp)\b", line)
             if match:
-                metrics = {"generated_tokens": int(match.group(1)), "decode_ms": float(match.group(2)), "decode_toks": float(match.group(3))}
+                metrics["mtp"] = match.group(1)
                 break
         return {"file": path.name, "stage": stage, "age_seconds": round(max(0, time.time() - path.stat().st_mtime), 1),
                 "event": event[-300:], "metrics": metrics}
@@ -278,10 +335,11 @@ def telemetry(config=None):
     port = (config or {}).get("port") or arg_value("--port", 18200)
     gpus = gpu_list()
     activity = log_activity()
+    context = arg_value("-c", 0)
     return {"activity": activity, "gpus": gpus, "memory": system_memory(),
             "process": process_memory(state.get("pid") if state else None),
             "nvme": nvme_snapshot((config or {}).get("nvme_dir") or arg_value("--kvmem-nvme-dir")),
-            "server": {"pid": state.get("pid") if state else None, "port": int(port), "argv": argv}}
+            "server": {"pid": state.get("pid") if state else None, "port": int(port), "context": int(context or 0), "argv": argv}}
 
 
 def server_json(port, endpoint):
@@ -401,6 +459,9 @@ def command(config, action):
             raise ValueError(f"Open WebUI script missing: {OPEN_WEBUI}")
         openwebui_env = os.environ.copy()
         openwebui_env["KVMEM_OPENWEBUI_DEFAULT_MODEL"] = Path(config["model"]).name
+        # Carry the dashboard's explicit reasoning profile into Open WebUI;
+        # "off" remains the fast default and is handled by the script below.
+        openwebui_env["KVMEM_OPENWEBUI_THINKING"] = config["thinking"]
         return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(OPEN_WEBUI), "-NoOpen"], openwebui_env
     if action == "openwebui_stop":
         stop_script = OPEN_WEBUI.with_name("stop-open-webui.ps1")
@@ -536,22 +597,22 @@ body{font:14px system-ui,sans-serif;background:#10131a;color:#e8edf5;max-width:1
 <section><h2>Modell und Laufzeitprofil</h2><p><small><b>Wichtig:</b> Das Modell ist die GGUF-Datei mit den quantisierten Gewichten (z. B. IQ4). Das <b>Rezept</b> ist nur ein Laufzeitprofil: Es wählt Speicherbudgets, KV-Cache, MTP und sichere Startwerte. Es muss nicht den Dateinamen kopieren, sollte aber zur Quantisierung passen: IQ3 spart mehr VRAM für KV, IQ4 braucht etwas weniger KV-Budget. Das Rezept ändert die Gewichte des Modells nicht. Wenn du unsicher bist, nimm das passende Profil (IQ4-Modell → IQ4).</small></p><p id=compat><small>Modell/Rezept werden geprüft …</small></p><div class=grid><label title="Laufzeitprofil, nicht die Quantisierung der GGUF-Datei">Rezept<select id=recipe><option value=iq3>IQ3 · mehr Speicher für KV/Retrieval</option><option value=iq4>IQ4 · weniger Gewichtsspeicher</option></select></label><label title="Die GGUF-Datei, die tatsächlich geladen wird">Modell<select id=model></select></label><label title="Nur für Bilder; bei Text-Chats leer lassen">Vision-Projektor<select id=mmproj></select></label><label title="CPU ist langsamer, lässt aber mehr VRAM für Modell und KV frei">Vision<select id=vision><option>cpu</option><option>gpu</option></select></label><label title="CUDA-Gerät; automatisch wählt die passende NVIDIA-GPU">GPU<select id=gpu><option value=auto>automatisch</option></select></label><label title="Datentyp des laufzeitgenerierten KV-Caches; nicht die Modellquantisierung">KV-Dtype<select id=kv><option>q8_0</option><option>q5_0</option><option>q4_0</option><option>f16</option></select></label><label title="Interne Denk-Tokens vor der sichtbaren Antwort. Aus liefert für erste Tests schneller sichtbaren Text; größere Budgets brauchen mehr Zeit.">Thinking/Reasoning<select id=thinking><option value=off>aus · schneller sichtbarer Text</option><option value=256>256 Tokens</option><option value=1024>1024 Tokens</option><option value=4096>4096 Tokens</option></select></label></div><details><summary>Was sollte ich auswählen?</summary><p>Für ein IQ4-Modell: Rezept IQ4, KV q5_0, Vision CPU. Für ein IQ3-Modell: Rezept IQ3, KV q8_0. Ein anderes KV-Dtype kann Speicher sparen, aber Geschwindigkeit oder Qualität beeinflussen. Thinking erzeugt interne Begründungstokens, bevor Text erscheint; für einen Funktionstest ist <b>aus</b> am schnellsten. Die Auswahl wird erst mit <b>Starten</b> angewendet.</p></details></section>
 <section><h2>Kontext und KVMem</h2><div class=grid><label title="Maximale Promptlänge inklusive Historie">Kontext (Tokens)<input id=context type=number value=262144 min=1></label><label title="GPU-KV-Fenster für Retrieval; größer = mehr VRAM">Retrieval-Budget<input id=budget type=number value=36864 min=1></label><label title="Reservierte Slots für die Antwort; muss zur erwarteten Antwortlänge passen">Generierungsreserve<input id=reserve type=number value=16384 min=1></label><label title="Tokens je KVMem-Block; kleiner ist feiner, aber langsamer">Blockgröße<input id=block type=number value=128 min=1></label><label title="MTP erzeugt Entwürfe und kann Decode beschleunigen">MTP<select id=mtp><option value=on>an</option><option value=off>aus</option></select></label><label title="Anzahl vorgeschlagener Tokens pro MTP-Schritt">MTP-Draft-Länge<input id=draft_max type=number value=3 min=1 max=5></label><label title="retrieval holt relevante Blöcke, recency bevorzugt die jüngsten">Retrieval-Methode<select id=method><option>retrieval</option><option>recency</option></select></label><label title="Automatisch optimiert Wiederverwendung; legacy ist Kompatibilitätsmodus">Query-Replay<select id=replay><option>auto</option><option>legacy</option></select></label><label title="user nutzt die letzte Nutzerfrage als Query">Query-Policy<select id=policy><option>user</option><option>legacy</option></select></label></div></section>
 <section><h2>NVMe und Server</h2><div class=grid><label>NVMe-Budget (GiB)<input id=nvme_gb type=number value=64 min=0 step=0.5></label><label>NVMe-Verzeichnis<input id=nvme_dir></label><label>Port<input id=port type=number value=18200 min=1 max=65535></label></div><label style="display:block;margin-top:10px"><input id=raw_k type=checkbox checked> K/V auf NVMe auslagern</label><label style="display:block"><input id=kvmem type=checkbox checked> KVMem aktivieren</label><p><small><b>Vorschau (nur anzeigen)</b> zeigt den aufgelösten Startbefehl und ändert keinen Server. <b>Starten</b> fährt den Server hoch, <b>Neu starten</b> ersetzt einen laufenden KVMem-Server, <b>Stoppen</b> beendet ihn.</small></p><button data-action=preview onclick="act('preview')">Vorschau (nur anzeigen)</button><button data-action=start onclick="act('start')">Starten</button><button data-action=restart onclick="act('restart')" class=warn>Neu starten</button><button data-action=stop onclick="act('stop')" class=stop>Stoppen</button></section>
-<section><h2>Chat</h2><p><small>Open WebUI wird lokal mit Python eingerichtet und auf Port 3000 gestartet. Beim ersten Start kann die Installation einige Minuten dauern.</small></p><button data-action=openwebui onclick="act('openwebui')">Open WebUI einrichten und öffnen</button><button data-action=openwebui_stop class=stop onclick="act('openwebui_stop')">Open WebUI stoppen</button></section>
-<section><h2>Live-Status</h2><div class=cards><div class=card>Phase<b id=phase>–</b><small id=activity>–</small></div><div class=card>Decode<b id=toks>–</b><small>tok/s aus Server-Log</small></div><div class=card>GPU<b id=vram>–</b><small id=gpuutil>–</small></div><div class=card>RAM<b id=ram>–</b><small id=processmem>Prozess: –</small></div><div class=card>NVMe<b id=nvme>–</b><small id=nvmefree>–</small></div></div><details open><summary>Letztes Serverereignis</summary><pre id=event>–</pre></details><details><summary>Technische Details</summary><pre id=details>–</pre></details></section>
-<section><h2>Server-Log / Terminal-Ausgabe</h2><p><small>Hier erscheint laufend, ob das Modell lädt, Prefill läuft, dekodiert wird oder ein Fehler aufgetreten ist. GPU-Speicher kann beim Laden bereits voll sein; entscheidend ist, dass die Phase und das letzte Ereignis weiterlaufen.</small></p><pre id=output>–</pre></section>
+<section><h2>Chat</h2><p><small>Open WebUI wird lokal mit Python eingerichtet und auf Port 3000 gestartet. Beim ersten Start kann die Installation einige Minuten dauern. In Open WebUI findest du den Regler unter <b>Controls → Erweiterte Parameter → Reasoning Effort</b>. Wirksam wird er, wenn der Server unter „Thinking/Reasoning“ mit einem Budget gestartet wurde; „aus“ bleibt der schnelle Standard.</small></p><button data-action=openwebui onclick="act('openwebui')">Open WebUI einrichten und öffnen</button><button data-action=openwebui_stop class=stop onclick="act('openwebui_stop')">Open WebUI stoppen</button></section>
+<section><h2>Live-Status</h2><div class=cards><div class=card>Phase<b id=phase>–</b><small id=activity>–</small></div><div class=card>Kontext<b id=context_fill>–</b><small id=context_meta>–</small></div><div class=card>Prefill<b id=prefill_speed>–</b><small id=prefill_meta>–</small></div><div class=card>Decode<b id=toks>–</b><small id=decode_meta>tok/s aus Server-Log</small></div><div class=card>Gesamt<b id=total_speed>–</b><small id=mtp_meta>–</small></div><div class=card>GPU<b id=vram>–</b><small id=gpuutil>–</small></div><div class=card>RAM<b id=ram>–</b><small id=processmem>Prozess: –</small></div><div class=card>NVMe<b id=nvme>–</b><small id=nvmefree>–</small></div></div><details open><summary>Letztes Serverereignis</summary><pre id=event>–</pre></details><details><summary>Technische Details</summary><pre id=details>–</pre></details></section>
+<section><h2>Server-Log / Terminal-Ausgabe</h2><p><small>Kontext zeigt Prompt plus bereits erzeugte Tokens; Prefill ist die Verarbeitung der Eingabe, Decode die laufende Ausgabe, Gesamt umfasst beides. GPU-Speicher kann beim Laden bereits voll sein; entscheidend ist, dass Phase und Metriken weiterlaufen. „CUDA Graph … reused“ ist eine normale Wiederverwendung und kein Fehler.</small></p><pre id=output>–</pre></section>
 <script>
 const $=id=>document.getElementById(id), q=async u=>(await fetch(u)).json();
 let actionRunning=false, statusTimer=0;
 let catalog=[];
 function compatibility(){let n=$('model').selectedOptions[0]?.textContent.toLowerCase()||'',r=$('recipe').value;if((n.includes('iq4')&&r==='iq3')||(n.includes('iq3')&&r==='iq4'))$('compat').innerHTML='<small>Hinweis: Modell und Rezept haben unterschiedliche IQ-Stufen. Das ist technisch möglich, aber das passende Profil ist als Ausgangspunkt empfohlen.</small>';else $('compat').innerHTML='<small>Modell und Rezept passen als Laufzeitprofil zusammen.</small>'}
-function fill(defaults){let m=catalog.filter(x=>!x.mmproj),p=catalog.filter(x=>x.mmproj),e=x=>x.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); $('model').innerHTML=m.map(x=>`<option value="${e(x.path)}">${e(x.name)}</option>`).join(''); $('mmproj').innerHTML='<option value="">Text-only (kein Projektor)</option>'+p.map(x=>`<option value="${e(x.path)}">${e(x.name)}</option>`).join(''); if(defaults?.model)$('model').value=defaults.model;if(defaults?.mmproj)$('mmproj').value=defaults.mmproj;let n=$('model').selectedOptions[0]?.textContent.toLowerCase()||'';if(n.includes('iq4')||n.includes('ud-iq4')){$('recipe').value='iq4';$('kv').value='q5_0';$('budget').value='32768';$('reserve').value='12288'}$('model').onchange=compatibility;$('recipe').onchange=compatibility;compatibility()}
+function fill(defaults){let m=catalog.filter(x=>!x.mmproj),p=catalog.filter(x=>x.mmproj),e=x=>x.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); $('model').innerHTML=m.map(x=>`<option value="${e(x.path)}">${e(x.name)}</option>`).join(''); $('mmproj').innerHTML='<option value="">Text-only (kein Projektor)</option>'+p.map(x=>`<option value="${e(x.path)}">${e(x.name)}</option>`).join(''); if(defaults?.model)$('model').value=defaults.model;if(defaults?.mmproj)$('mmproj').value=defaults.mmproj;let n=$('model').selectedOptions[0]?.textContent.toLowerCase()||'';if(n.includes('iq4')||n.includes('ud-iq4')){$('recipe').value='iq4';$('kv').value='q5_0';$('budget').value='32768';$('reserve').value='12288';$('mtp').value='on'}else if(n.includes('iq3')){$('recipe').value='iq3';$('kv').value='q8_0';$('budget').value='36864';$('reserve').value='16384';$('mtp').value='off'}$('model').onchange=compatibility;$('recipe').onchange=compatibility;compatibility()}
 async function load(){let x=await q('/api/models');catalog=x.models;fill(x.defaults); let g=await q('/api/gpus'); $('gpu').innerHTML='<option value="auto">automatisch</option>'+g.gpus.map(x=>`<option value="${x.index}">${x.index}: ${x.name} (${x.memory_mb} MB)</option>`).join(''); $('nvme_dir').value='cache/nvme'; status()}
 function config(){return {action:'',recipe:$('recipe').value,model:$('model').value,mmproj:$('mmproj').value,vision:$('vision').value,gpu:$('gpu').value,kv:$('kv').value,thinking:$('thinking').value,context:$('context').value,budget:$('budget').value,reserve:$('reserve').value,block:$('block').value,draft_max:$('draft_max').value,mtp:$('mtp').value,method:$('method').value,replay:$('replay').value,policy:$('policy').value,nvme_gb:$('nvme_gb').value,nvme_dir:$('nvme_dir').value,port:$('port').value,raw_k:$('raw_k').checked,kvmem:$('kvmem').checked}}
 async function openWebUI(chat){for(let i=0;i<900;i++){await new Promise(resolve=>setTimeout(resolve,1000));let x=await q('/api/status');if(x.job&&x.job.action==='openwebui'&&!x.job.running){if(x.job.returncode===0){let w=await q('/api/openwebui');if(w.ready){chat.location.href=w.url;return}}chat?.close();if(x.job.returncode!==0)alert('Open WebUI konnte nicht gestartet werden:\n'+(x.job.output||'Unbekannter Fehler'));return}}chat?.close();alert('Open WebUI braucht ungewöhnlich lange. Details stehen im Status/Log.')}
 async function waitJob(action){for(let i=0;i<480;i++){await new Promise(resolve=>setTimeout(resolve,500));let x=await q('/api/status');if(x.job&&x.job.action===action&&!x.job.running)return x.job}return null}
 async function act(action){if(actionRunning)return;let c=config();c.action=action;let chat=action==='openwebui'?window.open('about:blank','_blank'):null;actionRunning=true;document.querySelectorAll('[data-action]').forEach(x=>x.disabled=true);$('state').textContent=action==='preview'?'Vorschau wird erstellt …':'Aktion läuft: '+action+' …';try{let r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});let x=await r.json();if(!r.ok){chat?.close();alert(x.error)}else if(action==='openwebui')await openWebUI(chat);else await waitJob(action);}catch(e){chat?.close();alert('Dashboard-Verbindung fehlgeschlagen: '+e)}finally{actionRunning=false;document.querySelectorAll('[data-action]').forEach(x=>x.disabled=false);status()}}
 function fmt(v,suffix=''){return v===null||v===undefined||v===''?'–':v+suffix}
-async function status(){try{let x=await q('/api/status'),h=x.health,j=x.job,t=x.telemetry||{},a=t.activity||{},g=(t.gpus||[])[0],m=t.memory,p=t.process,n=t.nvme;if(j&&j.running)$('state').textContent='Aktion läuft: '+j.action+' …';else if(h)$('state').textContent='Server läuft';else $('state').textContent='Server nicht aktiv';$('phase').textContent=a.stage||'–';$('activity').textContent=a.age_seconds===null?'–':'Letztes Log vor '+a.age_seconds+' s';let metric=a.metrics||{};$('toks').textContent=metric.decode_toks?metric.decode_toks.toFixed(2):'–';$('vram').textContent=g&&g.used_mb?g.used_mb+' / '+g.memory_mb+' MB':'–';$('gpuutil').textContent=g&&g.utilization?('GPU-Auslastung: '+g.utilization+' %'):'–';$('ram').textContent=m?m.used_gib+' / '+m.total_gib+' GiB':'–';$('processmem').textContent=p&&p.working_set_gib?('Server: '+p.working_set_gib+' GiB Working Set'):'Prozess: –';$('nvme').textContent=n&&n.cache_gib!==undefined?n.cache_gib+' GiB Cache':'–';$('nvmefree').textContent=n&&n.free_gib!==undefined?n.free_gib+' GiB frei':'–';$('event').textContent=a.event||'–';$('details').textContent=JSON.stringify({health:x.health,models:x.models,server:t.server,job:j},null,2);$('output').textContent=(x.logs||'')||'Noch keine Log-Ausgabe.'}catch(e){$('state').textContent='Dashboard wartet auf den Server';$('event').textContent=String(e);$('output').textContent=String(e)}finally{clearTimeout(statusTimer);statusTimer=setTimeout(status,2000)}}
+async function status(){try{let x=await q('/api/status'),h=x.health,j=x.job,t=x.telemetry||{},a=t.activity||{},g=(t.gpus||[])[0],m=t.memory,p=t.process,n=t.nvme;if(j&&j.running)$('state').textContent='Aktion läuft: '+j.action+' …';else if(h)$('state').textContent='Server läuft';else $('state').textContent='Server nicht aktiv';$('phase').textContent=a.stage||'–';$('activity').textContent=a.age_seconds===null?'–':'Letztes Log vor '+a.age_seconds+' s';let metric=a.metrics||{},context=metric.context_tokens||0,capacity=(t.server||{}).context||0;$('context_fill').textContent=context&&capacity?context.toLocaleString('de-DE')+' / '+capacity.toLocaleString('de-DE'):'–';$('context_meta').textContent=context&&capacity?(100*context/capacity).toFixed(1)+' % belegt':metric.prompt_tokens?'Prompt: '+metric.prompt_tokens+' Tokens':'Noch keine Anfrage';$('prefill_speed').textContent=metric.prefill_toks?metric.prefill_toks.toFixed(1)+' tok/s':'–';$('prefill_meta').textContent=metric.prefill_ms?metric.prefill_ms.toFixed(0)+' ms · '+(metric.prompt_tokens||0)+' Tokens':'Noch keine Anfrage';$('toks').textContent=metric.decode_toks?metric.decode_toks.toFixed(2)+' tok/s':'–';$('decode_meta').textContent=metric.decode_ms?metric.decode_ms.toFixed(0)+' ms · '+(metric.generated_tokens||0)+' Tokens':'Noch keine Anfrage';$('total_speed').textContent=metric.total_toks?metric.total_toks.toFixed(2)+' tok/s':'–';$('mtp_meta').textContent=metric.mtp?('MTP: '+metric.mtp+(metric.mtp_accept_pct!==undefined?' · Akzeptanz '+metric.mtp_accept_pct.toFixed(1)+' %':'')):'MTP: –';$('vram').textContent=g&&g.used_mb?g.used_mb+' / '+g.memory_mb+' MB':'–';$('gpuutil').textContent=g&&g.utilization?('GPU-Auslastung: '+g.utilization+' %'):'–';$('ram').textContent=m?m.used_gib+' / '+m.total_gib+' GiB':'–';$('processmem').textContent=p&&p.working_set_gib?('Server: '+p.working_set_gib+' GiB Working Set'):'Prozess: –';$('nvme').textContent=n&&n.cache_gib!==undefined?n.cache_gib+' GiB Cache':'–';$('nvmefree').textContent=n&&n.free_gib!==undefined?n.free_gib+' GiB frei':'–';$('event').textContent=a.event||'–';$('details').textContent=JSON.stringify({health:x.health,models:x.models,server:t.server,job:j},null,2);$('output').textContent=(x.logs||'')||'Noch keine Log-Ausgabe.'}catch(e){$('state').textContent='Dashboard wartet auf den Server';$('event').textContent=String(e);$('output').textContent=String(e)}finally{clearTimeout(statusTimer);statusTimer=setTimeout(status,2000)}}
 load();
 </script>'''
 
