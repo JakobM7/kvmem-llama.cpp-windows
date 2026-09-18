@@ -101,7 +101,13 @@ The build script defaults to `CMAKE_CUDA_ARCHITECTURES=120a-real` for the tested
 
 ### Windows-Dashboard
 
-Nach dem Entpacken genügt ein Doppelklick auf `Start.bat`. Das lokale Dashboard öffnet sich automatisch im Standardbrowser und bietet Modellauswahl, IQ3/IQ4, Vision, GPU, Kontext, KVMem/MTP, Retrieval, NVMe-Budget sowie Start, Neustart, Vorschau und Stop. GGUF-Dateien werden aus `models` und `I:\models` eingelesen; eigene Verzeichnisse können über `KVMEM_MODEL_DIRS` (unter Windows mit `;` getrennt) gesetzt werden. Das Dashboard bindet ausschließlich an `127.0.0.1`.
+Nach dem Entpacken genügt ein Doppelklick auf `Start.bat`. Das lokale Dashboard öffnet sich automatisch im Standardbrowser und bietet Modellauswahl, IQ3/IQ4, Vision, GPU, Kontext, KVMem/MTP, Retrieval, NVMe-Budget sowie Start, Neustart, Vorschau und Stop. Nach Start oder Neustart öffnet es zusätzlich ein Chat-Tab, sobald der Server bereit ist. GGUF-Dateien werden aus `models` und `I:\models` eingelesen; eigene Verzeichnisse können über `KVMEM_MODEL_DIRS` (unter Windows mit `;` getrennt) gesetzt werden. Das Dashboard bindet ausschließlich an `127.0.0.1`.
+
+### Open WebUI unter Windows (optional)
+
+Mit installiertem Docker Desktop startet der Dashboard-Button **Open WebUI starten und öffnen** die Chat-Oberfläche unter `http://127.0.0.1:3000/`. Die Compose-Datei und die persistenten Open-WebUI-Daten liegen im Projekt; beim ersten Öffnen wird ein lokales Administratorkonto angelegt. Ohne Docker Desktop bleibt die integrierte lokale Chat-Oberfläche verfügbar. Open WebUI greift dabei über `host.docker.internal` auf den KVMem-OpenAI-kompatiblen Server zu.
+
+Zum manuellen Starten beziehungsweise Stoppen stehen `scripts/start-open-webui.ps1` und `scripts/stop-open-webui.ps1` bereit. Die Modelle bleiben in den konfigurierten Modellpfaden und werden nicht in Open WebUI kopiert.
 
 ## Browser chat
 

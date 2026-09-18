@@ -1,0 +1,18 @@
+services:
+  open-webui:
+    image: ${OPEN_WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:main}
+    container_name: kvmem-open-webui
+    ports:
+      - "${OPEN_WEBUI_PORT:-3000}:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      WEBUI_SECRET_KEY: ${OPEN_WEBUI_SECRET_KEY:-kvmem-open-webui-local-secret}
+      OPENAI_API_BASE_URL: ${KVMEM_OPENAI_API_BASE_URL:-http://host.docker.internal:18200/v1}
+      OPENAI_API_KEY: ${KVMEM_OPENAI_API_KEY:-sk-kvmem-local}
+    volumes:
+      - kvmem-open-webui-data:/app/backend/data
+    restart: unless-stopped
+
+volumes:
+  kvmem-open-webui-data:

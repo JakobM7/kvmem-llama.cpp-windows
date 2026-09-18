@@ -20,6 +20,9 @@ PORT = int(os.environ.get("KVMEM_DASHBOARD_PORT", "18600"))
 LAUNCHER = ROOT / "scripts" / "start-server.py"
 if not LAUNCHER.is_file():
     LAUNCHER = ROOT / "start-server.py"
+OPEN_WEBUI = ROOT / "scripts" / "start-open-webui.ps1"
+if not OPEN_WEBUI.is_file():
+    OPEN_WEBUI = ROOT / "start-open-webui.ps1"
 STATE = {"job": None, "scan": (0.0, []), "lock": threading.Lock()}
 
 
@@ -116,6 +119,25 @@ def server_json(port, endpoint):
         return None
 
 
+def open_webui_port():
+    try:
+        port = int(os.environ.get("OPEN_WEBUI_PORT", "3000"))
+    except ValueError as exc:
+        raise ValueError("OPEN_WEBUI_PORT must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("OPEN_WEBUI_PORT is out of range")
+    return port
+
+
+def open_webui_ready():
+    port = open_webui_port()
+    try:
+        with urllib.request.urlopen(f"http://{HOST}:{port}/", timeout=1) as response:
+            return response.status < 500
+    except (OSError, urllib.error.URLError):
+        return False
+
+
 def base_config(data):
     defaults = default_models()
     recipe = str(data.get("recipe", "iq3"))
@@ -197,6 +219,10 @@ def stop_config(data):
 
 
 def command(config, action):
+    if action == "openwebui":
+        if not OPEN_WEBUI.is_file():
+            raise ValueError(f"Open WebUI script missing: {OPEN_WEBUI}")
+        return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(OPEN_WEBUI), "-NoOpen"], os.environ.copy()
     env = os.environ.copy()
     env.update({"MODEL": config["model"], "MMPROJ_DEVICE": config["vision"],
                 "PORT": str(config["port"]), "BUILD_DIR": env.get("BUILD_DIR", str(ROOT / "build-windows" if (ROOT / "build-windows").is_dir() else ROOT)),
@@ -269,6 +295,9 @@ class Handler(BaseHTTPRequestHandler):
             if job and job.get("config"): port = job["config"].get("port", port)
             self.send_json({"health": server_json(port, "/health"), "models": server_json(port, "/v1/models"),
                             "job": job, "logs": tail_logs()}); return
+        if self.path == "/api/openwebui":
+            port = open_webui_port()
+            self.send_json({"ready": open_webui_ready(), "url": f"http://{HOST}:{port}/"}); return
         self.send_json({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -279,8 +308,9 @@ class Handler(BaseHTTPRequestHandler):
             if length > 256000: raise ValueError("request too large")
             data = json.loads(self.rfile.read(length).decode("utf-8"))
             action = data.pop("action", "start")
-            if action not in {"start", "restart", "stop", "preview"}: raise ValueError("invalid action")
-            config = stop_config(data) if action == "stop" else base_config(data)
+            if action not in {"start", "restart", "stop", "preview", "openwebui"}: raise ValueError("invalid action")
+            config = ({"port": open_webui_port()} if action == "openwebui" else
+                      stop_config(data) if action == "stop" else base_config(data))
             with STATE["lock"]:
                 if STATE["job"] and STATE["job"].get("running"): raise ValueError("another action is running")
                 STATE["job"] = {"running": True, "action": action, "config": config, "started": time.time()}
@@ -297,6 +327,7 @@ body{font:14px system-ui,sans-serif;background:#10131a;color:#e8edf5;max-width:1
 <section><h2>Modell und Rezept</h2><div class=grid><label>Rezept<select id=recipe><option value=iq3>IQ3 · mehr KV-Budget</option><option value=iq4>IQ4 · weniger Speicher</option></select></label><label>Modell<select id=model></select></label><label>Vision-Projektor<select id=mmproj></select></label><label>Vision<select id=vision><option>cpu</option><option>gpu</option></select></label><label>GPU<select id=gpu><option value=auto>automatisch</option></select></label><label>KV-Dtype<select id=kv><option>q8_0</option><option>q5_0</option><option>q4_0</option><option>f16</option></select></label></div></section>
 <section><h2>Kontext und KVMem</h2><div class=grid><label>Kontext (Tokens)<input id=context type=number value=262144 min=1></label><label>Retrieval-Budget<input id=budget type=number value=36864 min=1></label><label>Generierungsreserve<input id=reserve type=number value=16384 min=1></label><label>Blockgröße<input id=block type=number value=128 min=1></label><label>MTP<select id=mtp><option value=on>an</option><option value=off>aus</option></select></label><label>MTP-Draft-Länge<input id=draft_max type=number value=3 min=1 max=5></label><label>Retrieval-Methode<select id=method><option>retrieval</option><option>recency</option></select></label><label>Query-Replay<select id=replay><option>auto</option><option>legacy</option></select></label><label>Query-Policy<select id=policy><option>user</option><option>legacy</option></select></label></div></section>
 <section><h2>NVMe und Server</h2><div class=grid><label>NVMe-Budget (GiB)<input id=nvme_gb type=number value=64 min=0 step=0.5></label><label>NVMe-Verzeichnis<input id=nvme_dir></label><label>Port<input id=port type=number value=18200 min=1 max=65535></label></div><label style="display:block;margin-top:10px"><input id=raw_k type=checkbox checked> K/V auf NVMe auslagern</label><label style="display:block"><input id=kvmem type=checkbox checked> KVMem aktivieren</label><button onclick="act('preview')">Vorschau</button><button onclick="act('start')">Starten</button><button onclick="act('restart')" class=warn>Neu starten</button><button onclick="act('stop')" class=stop>Stoppen</button></section>
+<section><h2>Chat</h2><p><small>Open WebUI wird bevorzugt, wenn es bereits läuft. Sonst öffnet sich die integrierte lokale Chat-Oberfläche.</small></p><button onclick="act('openwebui')">Open WebUI starten und öffnen</button><button onclick="window.open('http://127.0.0.1:'+Number($('port').value||18200),'_blank')">Lokalen Chat öffnen</button></section>
 <section><h2>Status und Logs</h2><pre id=output>–</pre></section>
 <script>
 const $=id=>document.getElementById(id), q=async u=>(await fetch(u)).json();
@@ -304,7 +335,9 @@ let catalog=[];
 function fill(){let m=catalog.filter(x=>!x.mmproj),p=catalog.filter(x=>x.mmproj),e=x=>x.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); $('model').innerHTML=m.map(x=>`<option value="${e(x.path)}">${e(x.name)}</option>`).join(''); $('mmproj').innerHTML='<option value="">Text-only (kein Projektor)</option>'+p.map(x=>`<option value="${e(x.path)}">${e(x.name)}</option>`).join('')}
 async function load(){let x=await q('/api/models');catalog=x.models;fill(); let g=await q('/api/gpus'); $('gpu').innerHTML='<option value="auto">automatisch</option>'+g.gpus.map(x=>`<option value="${x.index}">${x.index}: ${x.name} (${x.memory_mb} MB)</option>`).join(''); $('nvme_dir').value='cache/nvme'; status()}
 function config(){return {action:'',recipe:$('recipe').value,model:$('model').value,mmproj:$('mmproj').value,vision:$('vision').value,gpu:$('gpu').value,kv:$('kv').value,context:$('context').value,budget:$('budget').value,reserve:$('reserve').value,block:$('block').value,draft_max:$('draft_max').value,mtp:$('mtp').value,method:$('method').value,replay:$('replay').value,policy:$('policy').value,nvme_gb:$('nvme_gb').value,nvme_dir:$('nvme_dir').value,port:$('port').value,raw_k:$('raw_k').checked,kvmem:$('kvmem').checked}}
-async function act(action){let c=config();c.action=action;$('state').textContent='Arbeite …';let r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});let x=await r.json();if(!r.ok)alert(x.error);status()}
+async function openChat(chat,port){for(let i=0;i<180;i++){await new Promise(resolve=>setTimeout(resolve,1000));let x=await q('/api/status');if(x.job&&!x.job.running){if(x.job.returncode===0&&x.health){let w=await q('/api/openwebui');chat.location.href=w.ready?w.url:`http://127.0.0.1:${port}/`;return}chat?.close();if(x.job.returncode!==0)alert('Serverstart fehlgeschlagen:\n'+(x.job.output||'Unbekannter Fehler'));return}}chat?.close()}
+async function openWebUI(chat){for(let i=0;i<180;i++){await new Promise(resolve=>setTimeout(resolve,1000));let x=await q('/api/status');if(x.job&&x.job.action==='openwebui'&&!x.job.running){if(x.job.returncode===0){let w=await q('/api/openwebui');if(w.ready){chat.location.href=w.url;return}}chat?.close();if(x.job.returncode!==0)alert('Open WebUI konnte nicht gestartet werden:\n'+(x.job.output||'Unbekannter Fehler'));return}}chat?.close()}
+async function act(action){let c=config();c.action=action;let chat=null;if((action==='start'||action==='restart'||action==='openwebui')&&Number.isInteger(Number(c.port)))chat=window.open('about:blank','_blank');$('state').textContent='Arbeite …';let r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});let x=await r.json();if(!r.ok){chat?.close();alert(x.error)}else if(action==='openwebui')void openWebUI(chat);else if(chat)void openChat(chat,Number(c.port));status()}
 async function status(){let x=await q('/api/status');let h=x.health;$('state').textContent=h?'Server läuft':'Server nicht aktiv';$('output').textContent=(x.job?JSON.stringify(x.job,null,2)+'\n':'')+(x.models?JSON.stringify(x.models,null,2)+'\n':'')+x.logs;setTimeout(status,2000)}
 load();
 </script>'''

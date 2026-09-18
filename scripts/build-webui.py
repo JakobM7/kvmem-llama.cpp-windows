@@ -4,12 +4,15 @@ import argparse
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
+NPM = 'npm.cmd' if os.name == 'nt' else 'npm'
+NPX = 'npx.cmd' if os.name == 'nt' else 'npx'
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
@@ -51,11 +54,11 @@ def main():
     lock_hash = hashlib.sha256((work / 'package-lock.json').read_bytes()).hexdigest()
     stamp = work / '.installed-lock'
     if not (work / 'node_modules').is_dir() or not stamp.is_file() or stamp.read_text() != lock_hash:
-        subprocess.run(['npm', 'ci', '--no-audit', '--no-fund'], cwd=work, check=True)
+        subprocess.run([NPM, 'ci', '--no-audit', '--no-fund'], cwd=work, check=True)
         stamp.write_text(lock_hash)
-    subprocess.run(['npx', 'svelte-kit', 'sync'], cwd=work, check=True)
-    subprocess.run(['npx', 'svelte-check', '--threshold', 'error'], cwd=work, check=True)
-    subprocess.run(['npx', 'vite', 'build'], cwd=work, check=True)
+    subprocess.run([NPX, 'svelte-kit', 'sync'], cwd=work, check=True)
+    subprocess.run([NPX, 'svelte-check', '--threshold', 'error'], cwd=work, check=True)
+    subprocess.run([NPX, 'vite', 'build'], cwd=work, check=True)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     shutil.copytree(work / 'dist', output, dirs_exist_ok=True)
