@@ -26,6 +26,22 @@ if not OPEN_WEBUI.is_file():
 STATE = {"job": None, "scan": (0.0, []), "lock": threading.Lock()}
 
 
+def default_build_dir():
+    """Use the first local build/package that actually contains the server binary."""
+    configured = os.environ.get("BUILD_DIR")
+    if configured:
+        return configured
+    binary = "llama-kvmem-server.exe" if os.name == "nt" else "llama-kvmem-server"
+    candidates = [ROOT / "build-windows", ROOT / "build", ROOT]
+    if (ROOT / "dist").is_dir():
+        candidates.extend(sorted((path for path in (ROOT / "dist").iterdir() if path.is_dir()),
+                                 key=lambda path: path.name.casefold()))
+    for candidate in candidates:
+        if (candidate / "bin" / binary).is_file():
+            return str(candidate)
+    return str(candidates[0])
+
+
 def model_dirs():
     raw = os.environ.get("KVMEM_MODEL_DIRS")
     values = raw.split(os.pathsep) if raw else [str(ROOT / "models"), r"I:\models"]
@@ -223,9 +239,14 @@ def command(config, action):
         if not OPEN_WEBUI.is_file():
             raise ValueError(f"Open WebUI script missing: {OPEN_WEBUI}")
         return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(OPEN_WEBUI), "-NoOpen"], os.environ.copy()
+    if action == "openwebui_stop":
+        stop_script = OPEN_WEBUI.with_name("stop-open-webui.ps1")
+        if not stop_script.is_file():
+            raise ValueError(f"Open WebUI stop script missing: {stop_script}")
+        return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(stop_script)], os.environ.copy()
     env = os.environ.copy()
     env.update({"MODEL": config["model"], "MMPROJ_DEVICE": config["vision"],
-                "PORT": str(config["port"]), "BUILD_DIR": env.get("BUILD_DIR", str(ROOT / "build-windows" if (ROOT / "build-windows").is_dir() else ROOT)),
+                "PORT": str(config["port"]), "BUILD_DIR": default_build_dir(),
                 "KVMEM_CONTEXT": str(config["context"]), "SPEC_TYPE": "draft-mtp" if config["mtp"] == "on" else "none",
                 "SPEC_DRAFT_N_MAX": str(config["draft_max"]), "KVMEM_QUERY_REPLAY": config["replay"],
                 "KVMEM_QUERY_POLICY": config["policy"], "KVMEM_METHOD": config["method"],
@@ -251,13 +272,28 @@ def command(config, action):
 
 
 def run_job(config, action):
+    proc = None
     try:
         argv, env = command(config, action)
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         proc = subprocess.Popen(argv, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace", creationflags=creationflags)
-        output, _ = proc.communicate(timeout=3600)
+        # The launcher starts the actual server detached.  A stuck launcher must
+        # not keep the dashboard's single-action slot occupied indefinitely.
+        timeout = 900 if action == "openwebui" else 240
+        output, _ = proc.communicate(timeout=timeout)
         result = {"action": action, "returncode": proc.returncode, "output": output[-8000:], "config": config}
+    except subprocess.TimeoutExpired:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        result = {"action": action, "returncode": 1,
+                  "output": f"Die Aktion wurde nach {timeout} Sekunden abgebrochen. "
+                            "Prüfe den Server-Log und starte sie danach erneut.", "config": config}
     except Exception as exc:  # surface failures in the dashboard instead of taking down its server
         result = {"action": action, "returncode": 1, "output": str(exc), "config": config}
     with STATE["lock"]:
@@ -308,11 +344,16 @@ class Handler(BaseHTTPRequestHandler):
             if length > 256000: raise ValueError("request too large")
             data = json.loads(self.rfile.read(length).decode("utf-8"))
             action = data.pop("action", "start")
-            if action not in {"start", "restart", "stop", "preview", "openwebui"}: raise ValueError("invalid action")
-            config = ({"port": open_webui_port()} if action == "openwebui" else
+            if action not in {"start", "restart", "stop", "preview", "openwebui", "openwebui_stop"}: raise ValueError("invalid action")
+            config = ({"port": open_webui_port()} if action in {"openwebui", "openwebui_stop"} else
                       stop_config(data) if action == "stop" else base_config(data))
             with STATE["lock"]:
-                if STATE["job"] and STATE["job"].get("running"): raise ValueError("another action is running")
+                previous = STATE["job"]
+                if previous and previous.get("running"):
+                    name = previous.get("action", "unbekannt")
+                    self.send_json({"error": f"Eine Aktion läuft bereits ({name}). "
+                                           "Warte, bis sie beendet ist; die Eingabefelder bleiben änderbar."}, 409)
+                    return
                 STATE["job"] = {"running": True, "action": action, "config": config, "started": time.time()}
             threading.Thread(target=run_job, args=(config, action), daemon=True).start()
             self.send_json({"ok": True, "job": STATE["job"]})
@@ -326,19 +367,20 @@ body{font:14px system-ui,sans-serif;background:#10131a;color:#e8edf5;max-width:1
 </style><h1>KVMem Windows Dashboard</h1><p><span id=state>Verbinde …</span> <small>nur lokal: 127.0.0.1</small></p>
 <section><h2>Modell und Rezept</h2><div class=grid><label>Rezept<select id=recipe><option value=iq3>IQ3 · mehr KV-Budget</option><option value=iq4>IQ4 · weniger Speicher</option></select></label><label>Modell<select id=model></select></label><label>Vision-Projektor<select id=mmproj></select></label><label>Vision<select id=vision><option>cpu</option><option>gpu</option></select></label><label>GPU<select id=gpu><option value=auto>automatisch</option></select></label><label>KV-Dtype<select id=kv><option>q8_0</option><option>q5_0</option><option>q4_0</option><option>f16</option></select></label></div></section>
 <section><h2>Kontext und KVMem</h2><div class=grid><label>Kontext (Tokens)<input id=context type=number value=262144 min=1></label><label>Retrieval-Budget<input id=budget type=number value=36864 min=1></label><label>Generierungsreserve<input id=reserve type=number value=16384 min=1></label><label>Blockgröße<input id=block type=number value=128 min=1></label><label>MTP<select id=mtp><option value=on>an</option><option value=off>aus</option></select></label><label>MTP-Draft-Länge<input id=draft_max type=number value=3 min=1 max=5></label><label>Retrieval-Methode<select id=method><option>retrieval</option><option>recency</option></select></label><label>Query-Replay<select id=replay><option>auto</option><option>legacy</option></select></label><label>Query-Policy<select id=policy><option>user</option><option>legacy</option></select></label></div></section>
-<section><h2>NVMe und Server</h2><div class=grid><label>NVMe-Budget (GiB)<input id=nvme_gb type=number value=64 min=0 step=0.5></label><label>NVMe-Verzeichnis<input id=nvme_dir></label><label>Port<input id=port type=number value=18200 min=1 max=65535></label></div><label style="display:block;margin-top:10px"><input id=raw_k type=checkbox checked> K/V auf NVMe auslagern</label><label style="display:block"><input id=kvmem type=checkbox checked> KVMem aktivieren</label><button onclick="act('preview')">Vorschau</button><button onclick="act('start')">Starten</button><button onclick="act('restart')" class=warn>Neu starten</button><button onclick="act('stop')" class=stop>Stoppen</button></section>
-<section><h2>Chat</h2><p><small>Open WebUI wird bevorzugt, wenn es bereits läuft. Sonst öffnet sich die integrierte lokale Chat-Oberfläche.</small></p><button onclick="act('openwebui')">Open WebUI starten und öffnen</button><button onclick="window.open('http://127.0.0.1:'+Number($('port').value||18200),'_blank')">Lokalen Chat öffnen</button></section>
+<section><h2>NVMe und Server</h2><div class=grid><label>NVMe-Budget (GiB)<input id=nvme_gb type=number value=64 min=0 step=0.5></label><label>NVMe-Verzeichnis<input id=nvme_dir></label><label>Port<input id=port type=number value=18200 min=1 max=65535></label></div><label style="display:block;margin-top:10px"><input id=raw_k type=checkbox checked> K/V auf NVMe auslagern</label><label style="display:block"><input id=kvmem type=checkbox checked> KVMem aktivieren</label><p><small><b>Vorschau (nur anzeigen)</b> zeigt den aufgelösten Startbefehl und ändert keinen Server. <b>Starten</b> fährt den Server hoch, <b>Neu starten</b> ersetzt einen laufenden KVMem-Server, <b>Stoppen</b> beendet ihn.</small></p><button data-action=preview onclick="act('preview')">Vorschau (nur anzeigen)</button><button data-action=start onclick="act('start')">Starten</button><button data-action=restart onclick="act('restart')" class=warn>Neu starten</button><button data-action=stop onclick="act('stop')" class=stop>Stoppen</button></section>
+<section><h2>Chat</h2><p><small>Open WebUI wird lokal mit Python eingerichtet und auf Port 3000 gestartet. Beim ersten Start kann die Installation einige Minuten dauern.</small></p><button data-action=openwebui onclick="act('openwebui')">Open WebUI einrichten und öffnen</button><button data-action=openwebui_stop class=stop onclick="act('openwebui_stop')">Open WebUI stoppen</button></section>
 <section><h2>Status und Logs</h2><pre id=output>–</pre></section>
 <script>
 const $=id=>document.getElementById(id), q=async u=>(await fetch(u)).json();
+let actionRunning=false, statusTimer=0;
 let catalog=[];
 function fill(){let m=catalog.filter(x=>!x.mmproj),p=catalog.filter(x=>x.mmproj),e=x=>x.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); $('model').innerHTML=m.map(x=>`<option value="${e(x.path)}">${e(x.name)}</option>`).join(''); $('mmproj').innerHTML='<option value="">Text-only (kein Projektor)</option>'+p.map(x=>`<option value="${e(x.path)}">${e(x.name)}</option>`).join('')}
 async function load(){let x=await q('/api/models');catalog=x.models;fill(); let g=await q('/api/gpus'); $('gpu').innerHTML='<option value="auto">automatisch</option>'+g.gpus.map(x=>`<option value="${x.index}">${x.index}: ${x.name} (${x.memory_mb} MB)</option>`).join(''); $('nvme_dir').value='cache/nvme'; status()}
 function config(){return {action:'',recipe:$('recipe').value,model:$('model').value,mmproj:$('mmproj').value,vision:$('vision').value,gpu:$('gpu').value,kv:$('kv').value,context:$('context').value,budget:$('budget').value,reserve:$('reserve').value,block:$('block').value,draft_max:$('draft_max').value,mtp:$('mtp').value,method:$('method').value,replay:$('replay').value,policy:$('policy').value,nvme_gb:$('nvme_gb').value,nvme_dir:$('nvme_dir').value,port:$('port').value,raw_k:$('raw_k').checked,kvmem:$('kvmem').checked}}
-async function openChat(chat,port){for(let i=0;i<180;i++){await new Promise(resolve=>setTimeout(resolve,1000));let x=await q('/api/status');if(x.job&&!x.job.running){if(x.job.returncode===0&&x.health){let w=await q('/api/openwebui');chat.location.href=w.ready?w.url:`http://127.0.0.1:${port}/`;return}chat?.close();if(x.job.returncode!==0)alert('Serverstart fehlgeschlagen:\n'+(x.job.output||'Unbekannter Fehler'));return}}chat?.close()}
-async function openWebUI(chat){for(let i=0;i<180;i++){await new Promise(resolve=>setTimeout(resolve,1000));let x=await q('/api/status');if(x.job&&x.job.action==='openwebui'&&!x.job.running){if(x.job.returncode===0){let w=await q('/api/openwebui');if(w.ready){chat.location.href=w.url;return}}chat?.close();if(x.job.returncode!==0)alert('Open WebUI konnte nicht gestartet werden:\n'+(x.job.output||'Unbekannter Fehler'));return}}chat?.close()}
-async function act(action){let c=config();c.action=action;let chat=null;if((action==='start'||action==='restart'||action==='openwebui')&&Number.isInteger(Number(c.port)))chat=window.open('about:blank','_blank');$('state').textContent='Arbeite …';let r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});let x=await r.json();if(!r.ok){chat?.close();alert(x.error)}else if(action==='openwebui')void openWebUI(chat);else if(chat)void openChat(chat,Number(c.port));status()}
-async function status(){let x=await q('/api/status');let h=x.health;$('state').textContent=h?'Server läuft':'Server nicht aktiv';$('output').textContent=(x.job?JSON.stringify(x.job,null,2)+'\n':'')+(x.models?JSON.stringify(x.models,null,2)+'\n':'')+x.logs;setTimeout(status,2000)}
+async function openWebUI(chat){for(let i=0;i<900;i++){await new Promise(resolve=>setTimeout(resolve,1000));let x=await q('/api/status');if(x.job&&x.job.action==='openwebui'&&!x.job.running){if(x.job.returncode===0){let w=await q('/api/openwebui');if(w.ready){chat.location.href=w.url;return}}chat?.close();if(x.job.returncode!==0)alert('Open WebUI konnte nicht gestartet werden:\n'+(x.job.output||'Unbekannter Fehler'));return}}chat?.close();alert('Open WebUI braucht ungewöhnlich lange. Details stehen im Status/Log.')}
+async function waitJob(action){for(let i=0;i<480;i++){await new Promise(resolve=>setTimeout(resolve,500));let x=await q('/api/status');if(x.job&&x.job.action===action&&!x.job.running)return x.job}return null}
+async function act(action){if(actionRunning)return;let c=config();c.action=action;let chat=action==='openwebui'?window.open('about:blank','_blank'):null;actionRunning=true;document.querySelectorAll('[data-action]').forEach(x=>x.disabled=true);$('state').textContent=action==='preview'?'Vorschau wird erstellt …':'Aktion läuft: '+action+' …';try{let r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});let x=await r.json();if(!r.ok){chat?.close();alert(x.error)}else if(action==='openwebui')await openWebUI(chat);else await waitJob(action);}catch(e){chat?.close();alert('Dashboard-Verbindung fehlgeschlagen: '+e)}finally{actionRunning=false;document.querySelectorAll('[data-action]').forEach(x=>x.disabled=false);status()}}
+async function status(){try{let x=await q('/api/status');let h=x.health,j=x.job;if(j&&j.running)$('state').textContent='Aktion läuft: '+j.action+' …';else if(h)$('state').textContent='Server läuft';else $('state').textContent='Server nicht aktiv';$('output').textContent=(j?JSON.stringify(j,null,2)+'\n':'')+(x.models?JSON.stringify(x.models,null,2)+'\n':'')+(x.logs||'')}catch(e){$('state').textContent='Dashboard wartet auf den Server';$('output').textContent=String(e)}finally{clearTimeout(statusTimer);statusTimer=setTimeout(status,2000)}}
 load();
 </script>'''
 

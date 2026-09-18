@@ -35,20 +35,10 @@ try {
     Copy-Item (Join-Path $Root 'scripts/stop-iq4.ps1') (Join-Path $stage 'stop-iq4.ps1')
     Copy-Item (Join-Path $Root 'scripts/start-open-webui.ps1') (Join-Path $stage 'start-open-webui.ps1')
     Copy-Item (Join-Path $Root 'scripts/stop-open-webui.ps1') (Join-Path $stage 'stop-open-webui.ps1')
-    Copy-Item (Join-Path $Root 'docker-compose.openwebui.yml') (Join-Path $stage 'docker-compose.openwebui.yml')
     Copy-Item (Join-Path $Root 'scripts/dashboard.py') (Join-Path $stage 'dashboard.py')
     Copy-Item (Join-Path $Root 'scripts/dashboard.py') (Join-Path $stage 'scripts/dashboard.py')
     Copy-Item (Join-Path $Root 'scripts/start-server.py') (Join-Path $stage 'scripts/start-server.py')
     Copy-Item (Join-Path $Root 'Start.bat') (Join-Path $stage 'Start.bat')
-    $uiCandidates = @()
-    if ($env:KVMEM_UI_DIR) { $uiCandidates += $env:KVMEM_UI_DIR }
-    $uiCandidates += (Join-Path $Root 'build/share/kvmem/ui'), (Join-Path $BuildDir 'share/kvmem/ui')
-    $uiSource = $uiCandidates | Where-Object { Test-Path (Join-Path $_ 'index.html') } | Select-Object -First 1
-    if ($uiSource) {
-        $uiTarget = Join-Path $stage 'share/kvmem/ui'
-        New-Item -ItemType Directory -Force $uiTarget | Out-Null
-        Copy-Item (Join-Path $uiSource '*') $uiTarget -Recurse -Force
-    }
     Copy-Item (Join-Path $Root 'VERSION') (Join-Path $stage 'VERSION')
     New-Item -ItemType Directory -Force (Join-Path $stage 'licenses') | Out-Null
     Copy-Item (Join-Path $Root 'llama.cpp/LICENSE') (Join-Path $stage 'licenses/llama.cpp-MIT.txt')

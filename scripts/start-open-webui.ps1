@@ -1,61 +1,175 @@
 [CmdletBinding()]
 param(
     [switch]$NoOpen,
-    [int]$TimeoutSeconds = 180
+    [int]$TimeoutSeconds = 180,
+    [int]$Port = $(if ($env:OPEN_WEBUI_PORT) { [int]$env:OPEN_WEBUI_PORT } else { 3000 })
 )
 
 $ErrorActionPreference = 'Stop'
-$Root = if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'docker-compose.openwebui.yml')) {
-    (Resolve-Path $PSScriptRoot).Path
-} else {
+$Root = if ((Split-Path $PSScriptRoot -Leaf) -ieq 'scripts') {
     (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+} else {
+    (Resolve-Path $PSScriptRoot).Path
 }
-$Compose = Join-Path $Root 'docker-compose.openwebui.yml'
-$docker = (Get-Command docker.exe -ErrorAction SilentlyContinue).Source
-if (-not $docker) { throw 'Docker Desktop is required for Open WebUI.' }
-if (-not (Test-Path -LiteralPath $Compose)) { throw "Missing compose file: $Compose" }
+$Venv = Join-Path $Root '.open-webui-venv'
+$LegacyVenv = Join-Path $PSScriptRoot '.open-webui-venv'
+if ((-not (Test-Path -LiteralPath $Venv)) -and (Test-Path -LiteralPath $LegacyVenv)) { $Venv = $LegacyVenv }
+$Data = Join-Path $Root '.open-webui-data'
+$LogDir = Join-Path $Root 'logs'
+$PidFile = Join-Path $Root '.open-webui.pid'
+$WebUi = Join-Path $Venv 'Scripts/open-webui.exe'
+$VenvPython = Join-Path $Venv 'Scripts/python.exe'
+$Url = "http://127.0.0.1:$Port/"
 
-function Test-DockerEngine {
-    $probe = Start-Process -FilePath $docker -ArgumentList @('info', '--format', '{{.ServerVersion}}') -WindowStyle Hidden -PassThru
-    if (-not $probe.WaitForExit(3000)) {
-        try { $probe.Kill() } catch { }
-        return $false
-    }
-    return $probe.ExitCode -eq 0
-}
+if (-not (1 -le $Port -and $Port -le 65535)) { throw 'OPEN_WEBUI_PORT must be between 1 and 65535.' }
+New-Item -ItemType Directory -Force $Data, $LogDir | Out-Null
 
-if (-not (Test-DockerEngine)) {
-    $desktop = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
-    if (Test-Path -LiteralPath $desktop) {
-        Start-Process -FilePath $desktop -WindowStyle Hidden | Out-Null
-    } else {
-        throw 'Docker Desktop is required for Open WebUI.'
-    }
-    $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(30, $TimeoutSeconds))
-    while (-not (Test-DockerEngine) -and [DateTime]::UtcNow -lt $deadline) {
-        Start-Sleep -Seconds 2
-    }
-}
-if (-not (Test-DockerEngine)) {
-    throw 'Docker Desktop did not become ready before the timeout.'
-}
-
-& $docker compose -f $Compose up -d
-if ($LASTEXITCODE) { throw 'Open WebUI container could not be started.' }
-
-$port = 3000
-if ($env:OPEN_WEBUI_PORT) { $port = [int]$env:OPEN_WEBUI_PORT }
-$url = "http://127.0.0.1:$port/"
-$deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(30, $TimeoutSeconds))
-$ready = $false
-while (-not $ready -and [DateTime]::UtcNow -lt $deadline) {
+function Test-Ready {
     try {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 3
-        $ready = $response.StatusCode -ge 200 -and $response.StatusCode -lt 500
-    } catch {
-        Start-Sleep -Seconds 2
-    }
+        $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 2
+        return $response.StatusCode -ge 200 -and $response.StatusCode -lt 500
+    } catch { return $false }
 }
-if (-not $ready) { throw "Open WebUI did not answer at $url before the timeout." }
-if (-not $NoOpen) { Start-Process $url }
-Write-Host "Open WebUI is ready at $url"
+
+function Get-UserCount([string]$Database) {
+    if (-not (Test-Path -LiteralPath $Database)) { return 0 }
+    if (-not (Test-Path -LiteralPath $VenvPython)) {
+        throw "Open WebUI Python fehlt: $VenvPython"
+    }
+    $code = @'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+try:
+    try:
+        rows = db.execute('select email from [user]').fetchall()
+        value = sum(1 for (email,) in rows if str(email or '').lower() != 'admin@localhost')
+    except sqlite3.OperationalError as error:
+        if 'no such table' not in str(error):
+            raise
+        value = 0
+    print(value)
+finally:
+    db.close()
+'@
+    $output = $code | & $VenvPython - $Database
+    if ($LASTEXITCODE -ne 0) { throw "Open WebUI-Datenbank konnte nicht geprüft werden: $($output -join ' ')" }
+    $value = ($output | Select-Object -Last 1).ToString().Trim()
+    if ($value -notmatch '^\d+$') { throw "Ungültige Benutzeranzahl in Open WebUI-Datenbank: $value" }
+    return [int]$value
+}
+
+function Backup-ExistingUsers {
+    $database = Join-Path $Data 'webui.db'
+    if ((Get-UserCount $database) -eq 0) { return }
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backup = Join-Path $Root ".open-webui-data.login-backup-$stamp"
+    $suffix = 1
+    while (Test-Path -LiteralPath $backup) {
+        $backup = Join-Path $Root ".open-webui-data.login-backup-$stamp-$suffix"
+        $suffix++
+    }
+    Move-Item -LiteralPath $Data -Destination $backup
+    New-Item -ItemType Directory -Force $Data | Out-Null
+    Write-Warning "Open WebUI-Benutzerdaten wurden reversibel verschoben nach $backup"
+}
+
+function Invoke-Python([string[]]$Arguments) {
+    & $script:PythonExe @script:PythonPrefix @Arguments
+    if ($LASTEXITCODE) { throw "Python command failed ($LASTEXITCODE): $($Arguments -join ' ')" }
+}
+
+if (-not (Test-Path -LiteralPath $WebUi)) {
+    $script:PythonExe = $null
+    $script:PythonPrefix = @()
+    $py = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($py) {
+        foreach ($version in @('3.11', '3.12')) {
+            try { $probe = & $py.Source "-$version" --version 2>&1 } catch { $probe = $null }
+            if ($LASTEXITCODE -eq 0) {
+                $script:PythonExe = $py.Source
+                $script:PythonPrefix = @("-$version")
+                break
+            }
+        }
+    }
+    if (-not $script:PythonExe) {
+        foreach ($candidate in @('python.exe', 'python3.exe')) {
+            $command = Get-Command $candidate -ErrorAction SilentlyContinue
+            if (-not $command) { continue }
+            $probe = & $command.Source --version 2>&1
+            if ($LASTEXITCODE -eq 0 -and $probe -match 'Python 3\.(11|12)\.') {
+                $script:PythonExe = $command.Source
+                break
+            }
+        }
+    }
+    if (-not $script:PythonExe) {
+        $uv = Get-Command uv.exe -ErrorAction SilentlyContinue
+        if ($uv) {
+            & $uv.Source venv --python 3.11 $Venv
+            if ($LASTEXITCODE -eq 0) { $script:PythonExe = $uv.Source; $script:PythonPrefix = @('run', '--python', $VenvPython, 'python') }
+        }
+    }
+    if (-not $script:PythonExe) {
+        throw 'Open WebUI braucht Python 3.11 oder 3.12. Installiere eine dieser Versionen und starte erneut.'
+    }
+    if (-not (Test-Path -LiteralPath $VenvPython)) { Invoke-Python @('-m', 'venv', $Venv) }
+    $script:PythonExe = $VenvPython
+    $script:PythonPrefix = @()
+    Invoke-Python @('-m', 'pip', 'install', '--upgrade', 'pip')
+    Invoke-Python @('-m', 'pip', 'install', 'open-webui')
+}
+
+if (-not (Test-Path -LiteralPath $WebUi)) {
+    throw "Open WebUI konnte nicht installiert werden: $WebUi fehlt."
+}
+if (Test-Ready) {
+    if (-not $NoOpen) { Start-Process $Url }
+    Write-Host "Open WebUI läuft bereits unter $Url"
+    exit 0
+}
+
+$activeProcess = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+        ($_.ExecutablePath -and $_.ExecutablePath -ieq $WebUi) -or
+        ($_.CommandLine -and $_.CommandLine -like "*$WebUi*")
+    } |
+    Select-Object -First 1
+if ($activeProcess) {
+    throw "Open WebUI läuft bereits (PID $($activeProcess.ProcessId)); Datenbank bleibt unverändert."
+}
+Backup-ExistingUsers
+
+$env:DATA_DIR = $Data
+$env:OPENAI_API_BASE_URL = if ($env:KVMEM_OPENAI_API_BASE_URL) { $env:KVMEM_OPENAI_API_BASE_URL } else { 'http://127.0.0.1:18200/v1' }
+$env:OPENAI_API_BASE_URLS = $env:OPENAI_API_BASE_URL
+$env:OPENAI_API_KEYS = if ($env:KVMEM_OPENAI_API_KEY) { $env:KVMEM_OPENAI_API_KEY } else { 'sk-kvmem-local' }
+$env:OPENAI_API_KEY = $env:OPENAI_API_KEYS
+$env:WEBUI_AUTH = 'false'
+$env:ENABLE_OLLAMA_API = 'false'
+$env:ENABLE_PERSISTENT_CONFIG = 'false'
+$defaultModel = if ([string]::IsNullOrWhiteSpace($env:KVMEM_OPENWEBUI_DEFAULT_MODEL)) {
+    'Qwen3.8-27B-Uncensored-IQ4_XS.gguf'
+} else {
+    $env:KVMEM_OPENWEBUI_DEFAULT_MODEL.Trim()
+}
+$env:DEFAULT_MODELS = $defaultModel
+$env:DEFAULT_PINNED_MODELS = $defaultModel
+$env:WEBUI_URL = $Url.TrimEnd('/')
+$stdout = Join-Path $LogDir 'open-webui.stdout.log'
+$stderr = Join-Path $LogDir 'open-webui.stderr.log'
+$process = Start-Process -FilePath $WebUi -ArgumentList @('serve', '--host', '127.0.0.1', '--port', $Port) -WorkingDirectory $Root -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+$process.Id | Set-Content -LiteralPath $PidFile -Encoding ascii
+
+$deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(30, $TimeoutSeconds))
+while (-not (Test-Ready) -and [DateTime]::UtcNow -lt $deadline) {
+    if ($process.HasExited) {
+        $errorText = if (Test-Path $stderr) { Get-Content $stderr -Raw } else { '' }
+        throw "Open WebUI wurde beendet (Exit $($process.ExitCode)). $errorText"
+    }
+    Start-Sleep -Seconds 2
+}
+if (-not (Test-Ready)) { throw "Open WebUI antwortet nicht unter $Url. Details: $stderr" }
+if (-not $NoOpen) { Start-Process $Url }
+Write-Host "Open WebUI ist bereit unter $Url"

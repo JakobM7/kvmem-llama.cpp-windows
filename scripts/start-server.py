@@ -595,7 +595,11 @@ def main():
         if not (ui / 'index.html').is_file():
             raise ValueError(f'UI directory has no index.html: {ui}')
         argv += ['--ui-dir', str(ui)]
-    if args.no_ui:
+    elif args.no_ui or os.name == 'nt':
+        # Open WebUI is the supported browser front end. Do not accidentally
+        # serve a stale generated static page from share/kvmem/ui.
+        argv += ['--no-ui']
+    if args.no_ui and args.ui_dir is not None:
         argv += ['--no-ui']
     # These match server defaults; only emit caller overrides.
     if args.kvmem_block_tokens is not None:

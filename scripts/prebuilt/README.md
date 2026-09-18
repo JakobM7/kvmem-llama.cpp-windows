@@ -23,7 +23,7 @@ CUDA_VISIBLE_DEVICES=0 MODEL=/path/Qwen3.8-27B-UD-IQ4_XS-mtp-q4_0.gguf \
 
 Choose one service on port 18200; add `--restart` to switch this package's service. An unrelated listener is never stopped. `--dry-run` previews arguments. Both recipes use MTP3/ReplaySSM; IQ3 uses GPU Q8 vision and Q8 main KV; IQ4 uses CPU BF16 vision and Q5 main KV. To match the current local experiment, add `--kvmem-block-tokens 32 --reasoning-effort medium`; recipe defaults remain block 128 and the model's effort default.
 
-If `share/kvmem/ui/` is included, open `http://127.0.0.1:18200/` for lightweight text/image chat. No Node.js is required at runtime. `--ui-dir PATH` overrides the static directory and `--no-ui` disables it. Histories are stored in the browser; tools and stream resumption are not available in this page.
+The Windows package uses Open WebUI as its browser chat. Start it from the dashboard or with `scripts/start-open-webui.ps1`; it runs locally through the Python package and connects to `http://127.0.0.1:18200/v1`. The server API remains available for other OpenAI-compatible clients.
 
 ## Issue #1 short-prompt comparison
 

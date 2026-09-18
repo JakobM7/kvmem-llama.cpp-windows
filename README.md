@@ -101,27 +101,13 @@ The build script defaults to `CMAKE_CUDA_ARCHITECTURES=120a-real` for the tested
 
 ### Windows-Dashboard
 
-Nach dem Entpacken genügt ein Doppelklick auf `Start.bat`. Das lokale Dashboard öffnet sich automatisch im Standardbrowser und bietet Modellauswahl, IQ3/IQ4, Vision, GPU, Kontext, KVMem/MTP, Retrieval, NVMe-Budget sowie Start, Neustart, Vorschau und Stop. Nach Start oder Neustart öffnet es zusätzlich ein Chat-Tab, sobald der Server bereit ist. GGUF-Dateien werden aus `models` und `I:\models` eingelesen; eigene Verzeichnisse können über `KVMEM_MODEL_DIRS` (unter Windows mit `;` getrennt) gesetzt werden. Das Dashboard bindet ausschließlich an `127.0.0.1`.
+Nach dem Entpacken genügt ein Doppelklick auf `Start.bat`. Das lokale Dashboard öffnet sich automatisch im Standardbrowser und bietet Modellauswahl, IQ3/IQ4, Vision, GPU, Kontext, KVMem/MTP, Retrieval, NVMe-Budget sowie Start, Neustart, Vorschau und Stop. GGUF-Dateien werden aus `models` und `I:\models` eingelesen; eigene Verzeichnisse können über `KVMEM_MODEL_DIRS` (unter Windows mit `;` getrennt) gesetzt werden. Das Dashboard bindet ausschließlich an `127.0.0.1`.
 
 ### Open WebUI unter Windows (optional)
 
-Mit installiertem Docker Desktop startet der Dashboard-Button **Open WebUI starten und öffnen** die Chat-Oberfläche unter `http://127.0.0.1:3000/`. Die Compose-Datei und die persistenten Open-WebUI-Daten liegen im Projekt; beim ersten Öffnen wird ein lokales Administratorkonto angelegt. Ohne Docker Desktop bleibt die integrierte lokale Chat-Oberfläche verfügbar. Open WebUI greift dabei über `host.docker.internal` auf den KVMem-OpenAI-kompatiblen Server zu.
+Der Dashboard-Button **Open WebUI einrichten und öffnen** installiert Open WebUI bei Bedarf in einer lokalen Python-3.11/3.12-Virtualenv und startet es unter `http://127.0.0.1:3000/`. Die Windows-Standardeinstellung läuft ohne Login, wählt das laufende Qwen-Modell vor und deaktiviert die nicht verwendete Ollama-Anbindung. Die Daten liegen projektlokal in `.open-webui-data`; eine vorhandene Login-Datenbank wird beim Umschalten als `.open-webui-data.login-backup-*` verschoben, nicht gelöscht. Open WebUI greift direkt über `http://127.0.0.1:18200/v1` auf den KVMem-OpenAI-kompatiblen Server zu.
 
-Zum manuellen Starten beziehungsweise Stoppen stehen `scripts/start-open-webui.ps1` und `scripts/stop-open-webui.ps1` bereit. Die Modelle bleiben in den konfigurierten Modellpfaden und werden nicht in Open WebUI kopiert.
-
-## Browser chat
-
-The optional lightweight UI reuses llama.cpp's Markdown/code renderer, input components and browser-local history. It supports text and images, separate thinking effort/budget controls, stopping generation, and server-measured decode speed. It does not execute tools or manage model loading.
-
-Build the static page once with Node.js 22 and npm:
-
-```bash
-python3 scripts/build-webui.py
-```
-
-Then start the rebuilt server with the usual IQ3/IQ4 script and open `http://127.0.0.1:18200/`. The server automatically serves `build/share/kvmem/ui/` when present. Precompiled packages can include the page, so users do not need Node.js. `--ui-dir PATH` selects another static directory; `--no-ui` disables the page.
-
-Chat histories stay in this browser. Switching histories can require recomputing an uncached prompt; normal continuation reuses the existing KV cache. Closing or reloading the page interrupts generation; stream resumption is not included.
+Zum manuellen Starten beziehungsweise Stoppen stehen `scripts/start-open-webui.ps1` und `scripts/stop-open-webui.ps1` bereit. Die Modelle bleiben in den konfigurierten Modellpfaden und werden nicht in Open WebUI kopiert. Docker wird dafür nicht benötigt.
 
 ## Recommended settings (16 GiB)
 
