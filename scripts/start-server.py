@@ -473,7 +473,8 @@ def main():
         'IMAGE_MAX_TOKENS, SPEC_KV_DTYPE, SPEC_DRAFT_N_MAX, KVMEM_MTP_STATE, '
         'KVMEM_QUERY_REPLAY, KVMEM_QUERY_POLICY, KVMEM_CONTEXT, KVMEM_ENABLE, '
         'KVMEM_METHOD, KVMEM_RAW_K_NVME, KVMEM_NVME_GB, KVMEM_NVME_DIR, SPEC_TYPE, '
-        'MTP_ENABLE, CUDA_HOME, CUDA_PATH, LD_LIBRARY_PATH, NVIDIA_SMI.')
+        'MTP_ENABLE, KVMEM_THINKING, KVMEM_REASONING_BUDGET, CUDA_HOME, CUDA_PATH, '
+        'LD_LIBRARY_PATH, NVIDIA_SMI.')
     ap.add_argument('--recipe', choices=('iq3', 'iq4'), required=True)
     ap.add_argument('--default-model', required=True)
     ap.add_argument('--default-mmproj', required=True)
@@ -522,7 +523,9 @@ def main():
     policy = env.get('KVMEM_QUERY_POLICY', 'user')
     draft_kv = env.get('SPEC_KV_DTYPE', 'f16')
     spec_type_explicit = 'SPEC_TYPE' in env or 'MTP_ENABLE' in env
-    spec_type = env.get('SPEC_TYPE', 'draft-mtp')
+    # ISTA IQ3 is documented and measured without MTP; IQ4 keeps the fast
+    # draft-MTP default.  Explicit SPEC_TYPE/MTP_ENABLE still wins.
+    spec_type = env.get('SPEC_TYPE', 'none' if args.recipe == 'iq3' else 'draft-mtp')
     if env.get('MTP_ENABLE', '').strip().lower() in ('0', 'false', 'no', 'off'):
         spec_type = 'none'
     draft_max = int(env.get('SPEC_DRAFT_N_MAX', '3'))
@@ -543,6 +546,15 @@ def main():
     image_tokens = int(env.get('IMAGE_MAX_TOKENS', '512'))
     if not 1 <= port <= 65535 or image_tokens <= 0 or not 0 < args.startup_timeout <= 3600:
         raise ValueError('invalid PORT, IMAGE_MAX_TOKENS or startup timeout')
+    thinking = env.get('KVMEM_THINKING', 'on').strip().lower()
+    if thinking not in ('on', 'off'):
+        raise ValueError('KVMEM_THINKING must be on or off')
+    try:
+        reasoning_budget = int(env.get('KVMEM_REASONING_BUDGET', '4096'))
+    except ValueError as exc:
+        raise ValueError('KVMEM_REASONING_BUDGET must be an integer >= -1') from exc
+    if reasoning_budget < -1:
+        raise ValueError('KVMEM_REASONING_BUDGET must be an integer >= -1')
     env['CUDA_VISIBLE_DEVICES'] = choose_gpu(env)
     env.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
     library_key = 'PATH' if os.name == 'nt' else 'LD_LIBRARY_PATH'
@@ -560,7 +572,11 @@ def main():
     argv += [
             '--mmproj-offload' if vision == 'gpu' else '--no-mmproj-offload',
             '--image-max-tokens', str(image_tokens), '--host', '127.0.0.1', '--port', str(port),
-            '-c', str(context), '-n', str(args.reserve), '--enable-thinking', '--reasoning-budget', '4096']
+            '-c', str(context), '-n', str(args.reserve)]
+    if thinking == 'off':
+        argv += ['--no-think']
+    else:
+        argv += ['--enable-thinking', '--reasoning-budget', str(reasoning_budget)]
     if kvmem_enabled:
         if 'KVMEM_ENABLE' in env:
             argv += ['--kvmem']
