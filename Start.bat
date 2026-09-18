@@ -2,6 +2,7 @@
 setlocal
 cd /d "%~dp0"
 title KVMem Dashboard
+set "KVMEM_TERMINAL_OWNER=1"
 where python >nul 2>&1
 if errorlevel 1 (
   where pythonw >nul 2>&1
@@ -15,7 +16,9 @@ if exist "%~dp0scripts\dashboard.py" (
 ) else (
   python "%~dp0dashboard.py"
 )
+set "DASHBOARD_EXIT=%ERRORLEVEL%"
+call "%~dp0stop.bat" /silent
 echo.
 echo KVMem Dashboard beendet. Dieses Fenster kann jetzt geschlossen werden.
 pause
-endlocal
+endlocal & exit /b %DASHBOARD_EXIT%

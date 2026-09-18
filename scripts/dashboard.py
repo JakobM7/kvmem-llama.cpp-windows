@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -26,6 +28,25 @@ OPEN_WEBUI = ROOT / "scripts" / "start-open-webui.ps1"
 if not OPEN_WEBUI.is_file():
     OPEN_WEBUI = ROOT / "start-open-webui.ps1"
 STATE = {"job": None, "scan": (0.0, []), "lock": threading.Lock()}
+
+
+def start_terminal_cleanup():
+    """Keep the server tied to the Start.bat terminal on native Windows."""
+    if os.name != "nt" or os.environ.get("KVMEM_TERMINAL_OWNER") != "1":
+        return
+    watcher = ROOT / "scripts" / "terminal-cleanup.py"
+    if not watcher.is_file():
+        return
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.Popen(
+            [sys.executable, str(watcher), "--root", str(ROOT),
+             "--owner-pid", str(os.getpid()), "--terminal-pid", str(os.getppid())],
+            cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True, creationflags=creationflags)
+    except OSError:
+        # The dashboard remains usable if the optional cleanup helper cannot start.
+        pass
 
 
 def default_build_dir():
@@ -406,9 +427,12 @@ def base_config(data):
     method = str(data.get("method", "retrieval"))
     if replay not in {"auto", "legacy"} or policy not in {"user", "legacy"} or method not in {"retrieval", "recency"}:
         raise ValueError("invalid replay, policy or method")
-    thinking = str(data.get("thinking", "off")).strip().lower()
-    if thinking not in {"off", "256", "1024", "4096"}:
-        raise ValueError("thinking must be off, 256, 1024 or 4096")
+    thinking = str(data.get("thinking", data.get("reasoning_effort", "none"))).strip().lower()
+    if thinking == "off":
+        thinking = "none"
+    if thinking not in {"none", "default", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+                        "256", "1024", "4096"}:
+        raise ValueError("reasoning effort must be none, default, minimal, low, medium, high, xhigh, max or ultra")
     nvme_dir = str(data.get("nvme_dir", str(ROOT / "cache" / "nvme"))).strip()
     if not nvme_dir:
         nvme_dir = str(ROOT / "cache" / "nvme")
@@ -435,6 +459,49 @@ def base_config(data):
     }
 
 
+def runtime_config(data):
+    """Validate sampling defaults that the running server can apply to the next request."""
+    try:
+        port = int(data.get("port", 18200))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("port must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("port is out of range")
+
+    def number(name, default, minimum, maximum):
+        try:
+            value = float(data.get(name, default))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a number") from exc
+        if not math.isfinite(value) or value < minimum or value > maximum:
+            raise ValueError(f"{name} must be between {minimum} and {maximum}")
+        return value
+
+    def integer(name, default, minimum):
+        try:
+            value = int(data.get(name, default))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+        if value < minimum:
+            raise ValueError(f"{name} must be >= {minimum}")
+        return value
+
+    thinking = str(data.get("thinking", data.get("reasoning_effort", "none"))).strip().lower()
+    if thinking == "off":
+        thinking = "none"
+    if thinking not in {"none", "default", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
+        raise ValueError("reasoning effort must be none, default, minimal, low, medium, high, xhigh, max or ultra")
+    return {
+        "port": port, "thinking": thinking,
+        "temperature": number("temperature", 0.7, 0, 2),
+        "top_p": number("top_p", 0.8, 0, 1), "top_k": integer("top_k", 20, 0),
+        "min_p": number("min_p", 0, 0, 1),
+        "presence_penalty": number("presence_penalty", 1.5, -2, 2),
+        "frequency_penalty": number("frequency_penalty", 0, -2, 2),
+        "repeat_penalty": number("repeat_penalty", 1, 0.000001, 100),
+    }
+
+
 def stop_config(data):
     """Stop needs only the recipe and port; models may not be installed yet."""
     try:
@@ -450,7 +517,7 @@ def stop_config(data):
             "budget": 1, "reserve": 1, "block": 128, "context": 1, "draft_max": 1,
             "mtp": "off", "replay": "auto", "policy": "user", "method": "retrieval",
             "nvme_gb": 0, "nvme_dir": str(ROOT / "cache" / "nvme"), "gpu": "auto",
-            "thinking": "off", "port": port, "raw_k": False, "kvmem": False}
+            "thinking": "none", "port": port, "raw_k": False, "kvmem": False}
 
 
 def command(config, action):
@@ -460,7 +527,7 @@ def command(config, action):
         openwebui_env = os.environ.copy()
         openwebui_env["KVMEM_OPENWEBUI_DEFAULT_MODEL"] = Path(config["model"]).name
         # Carry the dashboard's explicit reasoning profile into Open WebUI;
-        # "off" remains the fast default and is handled by the script below.
+        # "none" remains the fast default and is handled by the script below.
         openwebui_env["KVMEM_OPENWEBUI_THINKING"] = config["thinking"]
         return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(OPEN_WEBUI), "-NoOpen"], openwebui_env
     if action == "openwebui_stop":
@@ -469,6 +536,8 @@ def command(config, action):
             raise ValueError(f"Open WebUI stop script missing: {stop_script}")
         return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(stop_script)], os.environ.copy()
     env = os.environ.copy()
+    effort = config["thinking"]
+    legacy_budget = effort if effort in {"256", "1024", "4096"} else ("0" if effort == "none" else "-1")
     env.update({"MODEL": config["model"], "MMPROJ_DEVICE": config["vision"],
                 "PORT": str(config["port"]), "BUILD_DIR": default_build_dir(),
                 "KVMEM_CONTEXT": str(config["context"]), "SPEC_TYPE": "draft-mtp" if config["mtp"] == "on" else "none",
@@ -476,8 +545,8 @@ def command(config, action):
                 "KVMEM_QUERY_POLICY": config["policy"], "KVMEM_METHOD": config["method"],
                 "KVMEM_NVME_GB": str(config["nvme_gb"]), "KVMEM_NVME_DIR": config["nvme_dir"],
                 "KVMEM_RAW_K_NVME": "1" if config["raw_k"] else "0", "KVMEM_ENABLE": "1" if config["kvmem"] else "0",
-                "KVMEM_THINKING": "off" if config["thinking"] == "off" else "on",
-                "KVMEM_REASONING_BUDGET": "0" if config["thinking"] == "off" else config["thinking"]})
+                "KVMEM_THINKING": "off" if effort == "none" else "on",
+                "KVMEM_REASONING_BUDGET": legacy_budget})
     if config["mmproj"]:
         env["MMPROJ"] = config["mmproj"]
     else:
@@ -488,6 +557,8 @@ def command(config, action):
             "--default-mmproj", config["mmproj"], "--default-vision-device", config["vision"], "--kv", config["kv"],
             "--budget", str(config["budget"]), "--reserve", str(config["reserve"]),
             "--kvmem-block-tokens", str(config["block"])]
+    if effort not in {"none", "default", "256", "1024", "4096"}:
+        args.extend(["--reasoning-effort", effort])
     if action == "restart":
         args.append("--restart")
     elif action == "stop":
@@ -497,18 +568,37 @@ def command(config, action):
     return [os.environ.get("PYTHON", "python"), *args], env
 
 
+def apply_runtime(config):
+    payload = {
+        "temperature": config["temperature"], "top_p": config["top_p"], "top_k": config["top_k"],
+        "min_p": config["min_p"], "presence_penalty": config["presence_penalty"],
+        "frequency_penalty": config["frequency_penalty"], "repeat_penalty": config["repeat_penalty"],
+        "reasoning_effort": config["thinking"],
+        "enable_thinking": config["thinking"] != "none",
+        "reasoning_budget_tokens": 0 if config["thinking"] == "none" else -1,
+    }
+    request = urllib.request.Request(
+        f"http://{HOST}:{config['port']}/props", data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return response.read().decode("utf-8")
+
+
 def run_job(config, action):
     proc = None
     try:
-        argv, env = command(config, action)
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-        proc = subprocess.Popen(argv, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, encoding="utf-8", errors="replace", creationflags=creationflags)
-        # The launcher starts the actual server detached.  A stuck launcher must
-        # not keep the dashboard's single-action slot occupied indefinitely.
-        timeout = 900 if action == "openwebui" else 240
-        output, _ = proc.communicate(timeout=timeout)
-        result = {"action": action, "returncode": proc.returncode, "output": output[-8000:], "config": config}
+        if action == "runtime":
+            result = {"action": action, "returncode": 0, "output": apply_runtime(config), "config": config}
+        else:
+            argv, env = command(config, action)
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            proc = subprocess.Popen(argv, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, encoding="utf-8", errors="replace", creationflags=creationflags)
+            # The launcher starts the actual server detached.  A stuck launcher must
+            # not keep the dashboard's single-action slot occupied indefinitely.
+            timeout = 900 if action == "openwebui" else 240
+            output, _ = proc.communicate(timeout=timeout)
+            result = {"action": action, "returncode": proc.returncode, "output": output[-8000:], "config": config}
     except subprocess.TimeoutExpired:
         if proc is not None and proc.poll() is None:
             proc.terminate()
@@ -559,6 +649,14 @@ class Handler(BaseHTTPRequestHandler):
             if job and job.get("config"): port = job["config"].get("port", port)
             self.send_json({"health": server_json(port, "/health"), "models": server_json(port, "/v1/models"),
                             "job": job, "logs": tail_logs(), "telemetry": telemetry(job.get("config") if job else None)}); return
+        if self.path == "/api/props":
+            state = latest_server_state()
+            argv = state.get("argv", []) if state else []
+            try:
+                port = int(argv[argv.index("--port") + 1]) if "--port" in argv else 18200
+            except (ValueError, IndexError):
+                port = 18200
+            self.send_json(server_json(port, "/props") or {}); return
         if self.path == "/api/openwebui":
             port = open_webui_port()
             self.send_json({"ready": open_webui_ready(), "url": f"http://{HOST}:{port}/"}); return
@@ -572,8 +670,9 @@ class Handler(BaseHTTPRequestHandler):
             if length > 256000: raise ValueError("request too large")
             data = json.loads(self.rfile.read(length).decode("utf-8"))
             action = data.pop("action", "start")
-            if action not in {"start", "restart", "stop", "preview", "openwebui", "openwebui_stop"}: raise ValueError("invalid action")
-            config = (base_config(data) if action == "openwebui" else
+            if action not in {"start", "restart", "stop", "preview", "runtime", "openwebui", "openwebui_stop"}: raise ValueError("invalid action")
+            config = (runtime_config(data) if action == "runtime" else
+                      base_config(data) if action == "openwebui" else
                       {"port": open_webui_port(), "model": ""} if action == "openwebui_stop" else
                       stop_config(data) if action == "stop" else base_config(data))
             with STATE["lock"]:
@@ -592,12 +691,13 @@ class Handler(BaseHTTPRequestHandler):
 
 HTML = r'''<!doctype html><meta charset="utf-8"><title>KVMem Windows Dashboard</title>
 <style>
-body{font:14px system-ui,sans-serif;background:#10131a;color:#e8edf5;max-width:1100px;margin:24px auto;padding:0 18px}h1{font-size:24px}h2{font-size:16px;margin:0 0 10px}section{background:#191e28;border:1px solid #30394a;border-radius:10px;padding:16px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px}.card{background:#0f141d;border:1px solid #30394a;border-radius:7px;padding:10px}.card b{display:block;font-size:17px;color:#e8edf5;margin-top:3px}label{display:flex;flex-direction:column;gap:4px;color:#aebbd0}input,select,button{font:inherit;border-radius:6px;border:1px solid #44516a;background:#0f141d;color:#edf2fa;padding:8px}button{cursor:pointer;background:#2869b2;border-color:#438bd8;margin:4px 4px 4px 0}button.warn{background:#84521e}button.stop{background:#8f3030}small{color:#91a0b7}pre{white-space:pre-wrap;max-height:330px;overflow:auto;background:#0c0f14;padding:10px;border-radius:6px}#state{font-weight:600;color:#8bd5a6}details{margin-top:10px;color:#aebbd0}summary{cursor:pointer;color:#cbd9ec}
+body{font:14px system-ui,sans-serif;background:#10131a;color:#e8edf5;max-width:1100px;margin:24px auto;padding:0 18px}h1{font-size:24px}h2{font-size:16px;margin:0 0 10px}section{background:#191e28;border:1px solid #30394a;border-radius:10px;padding:16px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px}.card{background:#0f141d;border:1px solid #30394a;border-radius:7px;padding:10px}.card b{display:block;font-size:17px;color:#e8edf5;margin-top:3px}label{display:flex;flex-direction:column;gap:4px;color:#aebbd0;position:relative}label[title]::after{content:'ⓘ';position:absolute;top:0;right:2px;color:#76b9f5;font-weight:700}label[title]::before{content:attr(title);position:absolute;z-index:5;top:25px;left:0;width:min(320px,calc(100vw - 48px));padding:8px 10px;border:1px solid #4d6685;border-radius:6px;background:#111a27;color:#edf2fa;box-shadow:0 8px 24px #0009;line-height:1.35;opacity:0;pointer-events:none;transform:translateY(-3px);transition:opacity .12s,transform .12s}label[title]:hover::before{opacity:1;transform:translateY(0)}input,select,button{font:inherit;border-radius:6px;border:1px solid #44516a;background:#0f141d;color:#edf2fa;padding:8px}button{cursor:pointer;background:#2869b2;border-color:#438bd8;margin:4px 4px 4px 0}button.warn{background:#84521e}button.stop{background:#8f3030}small{color:#91a0b7}pre{white-space:pre-wrap;max-height:330px;overflow:auto;background:#0c0f14;padding:10px;border-radius:6px}#state{font-weight:600;color:#8bd5a6}details{margin-top:10px;color:#aebbd0}summary{cursor:pointer;color:#cbd9ec}
 </style><h1>KVMem Windows Dashboard</h1><p><span id=state>Verbinde …</span> <small>nur lokal: 127.0.0.1 · automatische Aktualisierung alle 2 s</small></p>
-<section><h2>Modell und Laufzeitprofil</h2><p><small><b>Wichtig:</b> Das Modell ist die GGUF-Datei mit den quantisierten Gewichten (z. B. IQ4). Das <b>Rezept</b> ist nur ein Laufzeitprofil: Es wählt Speicherbudgets, KV-Cache, MTP und sichere Startwerte. Es muss nicht den Dateinamen kopieren, sollte aber zur Quantisierung passen: IQ3 spart mehr VRAM für KV, IQ4 braucht etwas weniger KV-Budget. Das Rezept ändert die Gewichte des Modells nicht. Wenn du unsicher bist, nimm das passende Profil (IQ4-Modell → IQ4).</small></p><p id=compat><small>Modell/Rezept werden geprüft …</small></p><div class=grid><label title="Laufzeitprofil, nicht die Quantisierung der GGUF-Datei">Rezept<select id=recipe><option value=iq3>IQ3 · mehr Speicher für KV/Retrieval</option><option value=iq4>IQ4 · weniger Gewichtsspeicher</option></select></label><label title="Die GGUF-Datei, die tatsächlich geladen wird">Modell<select id=model></select></label><label title="Nur für Bilder; bei Text-Chats leer lassen">Vision-Projektor<select id=mmproj></select></label><label title="CPU ist langsamer, lässt aber mehr VRAM für Modell und KV frei">Vision<select id=vision><option>cpu</option><option>gpu</option></select></label><label title="CUDA-Gerät; automatisch wählt die passende NVIDIA-GPU">GPU<select id=gpu><option value=auto>automatisch</option></select></label><label title="Datentyp des laufzeitgenerierten KV-Caches; nicht die Modellquantisierung">KV-Dtype<select id=kv><option>q8_0</option><option>q5_0</option><option>q4_0</option><option>f16</option></select></label><label title="Interne Denk-Tokens vor der sichtbaren Antwort. Aus liefert für erste Tests schneller sichtbaren Text; größere Budgets brauchen mehr Zeit.">Thinking/Reasoning<select id=thinking><option value=off>aus · schneller sichtbarer Text</option><option value=256>256 Tokens</option><option value=1024>1024 Tokens</option><option value=4096>4096 Tokens</option></select></label></div><details><summary>Was sollte ich auswählen?</summary><p>Für ein IQ4-Modell: Rezept IQ4, KV q5_0, Vision CPU. Für ein IQ3-Modell: Rezept IQ3, KV q8_0. Ein anderes KV-Dtype kann Speicher sparen, aber Geschwindigkeit oder Qualität beeinflussen. Thinking erzeugt interne Begründungstokens, bevor Text erscheint; für einen Funktionstest ist <b>aus</b> am schnellsten. Die Auswahl wird erst mit <b>Starten</b> angewendet.</p></details></section>
+<section><h2>Modell und Laufzeitprofil</h2><p><small><b>Wichtig:</b> Das Modell ist die GGUF-Datei mit den quantisierten Gewichten (z. B. IQ4). Das <b>Rezept</b> ist nur ein Laufzeitprofil: Es wählt Speicherbudgets, KV-Cache, MTP und sichere Startwerte. Es muss nicht den Dateinamen kopieren, sollte aber zur Quantisierung passen: IQ3 spart mehr VRAM für KV, IQ4 braucht etwas weniger KV-Budget. Das Rezept ändert die Gewichte des Modells nicht. Wenn du unsicher bist, nimm das passende Profil (IQ4-Modell → IQ4).</small></p><p id=compat><small>Modell/Rezept werden geprüft …</small></p><div class=grid><label title="Laufzeitprofil, nicht die Quantisierung der GGUF-Datei">Rezept<select id=recipe><option value=iq3>IQ3 · mehr Speicher für KV/Retrieval</option><option value=iq4>IQ4 · weniger Gewichtsspeicher</option></select></label><label title="Die GGUF-Datei, die tatsächlich geladen wird">Modell<select id=model></select></label><label title="Nur für Bilder; bei Text-Chats leer lassen">Vision-Projektor<select id=mmproj></select></label><label title="CPU ist langsamer, lässt aber mehr VRAM für Modell und KV frei">Vision<select id=vision><option>cpu</option><option>gpu</option></select></label><label title="CUDA-Gerät; automatisch wählt die passende NVIDIA-GPU">GPU<select id=gpu><option value=auto>automatisch</option></select></label><label title="Datentyp des laufzeitgenerierten KV-Caches; nicht die Modellquantisierung">KV-Dtype<select id=kv><option>q8_0</option><option>q5_0</option><option>q4_0</option><option>f16</option></select></label><label title="Modelle verwenden diese Stufen für die interne Begründung. none ist schnell und ohne Thinking; höhere Stufen können mehr Denkzeit benötigen.">Reasoning Effort<select id=thinking><option value=none>none · ohne Thinking</option><option value=default>default · Modellvorgabe</option><option value=minimal>minimal</option><option value=low>low</option><option value=medium>medium</option><option value=high>high</option><option value=xhigh>xhigh</option><option value=max>max</option><option value=ultra>ultra · falls vom Modell unterstützt</option></select></label></div><details><summary>Was sollte ich auswählen?</summary><p>Für ein IQ4-Modell: Rezept IQ4, KV q5_0, Vision CPU. Für ein IQ3-Modell: Rezept IQ3, KV q8_0. Ein anderes KV-Dtype kann Speicher sparen, aber Geschwindigkeit oder Qualität beeinflussen. Reasoning Effort verändert die interne Denkzeit; <b>none</b> liefert am schnellsten sichtbaren Text. Das Profil wird beim Start/Neustart gesetzt, kann danach zusätzlich über „Runtime-Parameter übernehmen“ geändert werden.</p></details></section>
 <section><h2>Kontext und KVMem</h2><div class=grid><label title="Maximale Promptlänge inklusive Historie">Kontext (Tokens)<input id=context type=number value=262144 min=1></label><label title="GPU-KV-Fenster für Retrieval; größer = mehr VRAM">Retrieval-Budget<input id=budget type=number value=36864 min=1></label><label title="Reservierte Slots für die Antwort; muss zur erwarteten Antwortlänge passen">Generierungsreserve<input id=reserve type=number value=16384 min=1></label><label title="Tokens je KVMem-Block; kleiner ist feiner, aber langsamer">Blockgröße<input id=block type=number value=128 min=1></label><label title="MTP erzeugt Entwürfe und kann Decode beschleunigen">MTP<select id=mtp><option value=on>an</option><option value=off>aus</option></select></label><label title="Anzahl vorgeschlagener Tokens pro MTP-Schritt">MTP-Draft-Länge<input id=draft_max type=number value=3 min=1 max=5></label><label title="retrieval holt relevante Blöcke, recency bevorzugt die jüngsten">Retrieval-Methode<select id=method><option>retrieval</option><option>recency</option></select></label><label title="Automatisch optimiert Wiederverwendung; legacy ist Kompatibilitätsmodus">Query-Replay<select id=replay><option>auto</option><option>legacy</option></select></label><label title="user nutzt die letzte Nutzerfrage als Query">Query-Policy<select id=policy><option>user</option><option>legacy</option></select></label></div></section>
-<section><h2>NVMe und Server</h2><div class=grid><label>NVMe-Budget (GiB)<input id=nvme_gb type=number value=64 min=0 step=0.5></label><label>NVMe-Verzeichnis<input id=nvme_dir></label><label>Port<input id=port type=number value=18200 min=1 max=65535></label></div><label style="display:block;margin-top:10px"><input id=raw_k type=checkbox checked> K/V auf NVMe auslagern</label><label style="display:block"><input id=kvmem type=checkbox checked> KVMem aktivieren</label><p><small><b>Vorschau (nur anzeigen)</b> zeigt den aufgelösten Startbefehl und ändert keinen Server. <b>Starten</b> fährt den Server hoch, <b>Neu starten</b> ersetzt einen laufenden KVMem-Server, <b>Stoppen</b> beendet ihn.</small></p><button data-action=preview onclick="act('preview')">Vorschau (nur anzeigen)</button><button data-action=start onclick="act('start')">Starten</button><button data-action=restart onclick="act('restart')" class=warn>Neu starten</button><button data-action=stop onclick="act('stop')" class=stop>Stoppen</button></section>
-<section><h2>Chat</h2><p><small>Open WebUI wird lokal mit Python eingerichtet und auf Port 3000 gestartet. Beim ersten Start kann die Installation einige Minuten dauern. In Open WebUI findest du den Regler unter <b>Controls → Erweiterte Parameter → Reasoning Effort</b>. Wirksam wird er, wenn der Server unter „Thinking/Reasoning“ mit einem Budget gestartet wurde; „aus“ bleibt der schnelle Standard.</small></p><button data-action=openwebui onclick="act('openwebui')">Open WebUI einrichten und öffnen</button><button data-action=openwebui_stop class=stop onclick="act('openwebui_stop')">Open WebUI stoppen</button></section>
+<section><h2>Sampling / Runtime-Defaults</h2><p><small>Diese Werte werden mit <b>Runtime-Parameter übernehmen</b> ohne Modell-Neustart für die nächste Anfrage gesetzt. Explizite Werte aus OpenWebUI oder einer API-Anfrage haben Vorrang.</small></p><div class=grid><label title="Zufallsvariation: 0 ist greedy, höhere Werte machen Antworten variabler.">Temperature<input id=temperature type=number value=0.7 min=0 max=2 step=0.05></label><label title="Nucleus-Sampling: berücksichtigt nur die wahrscheinlichsten Tokens bis zu dieser kumulierten Wahrscheinlichkeit.">Top-p<input id=top_p type=number value=0.8 min=0 max=1 step=0.01></label><label title="Begrenzt die Auswahl auf die K wahrscheinlichsten Tokens. 0 deaktiviert diese Begrenzung.">Top-k<input id=top_k type=number value=20 min=0 step=1></label><label title="Verwirft Tokens unterhalb dieses relativen Wahrscheinlichkeitsanteils.">Min-p<input id=min_p type=number value=0 min=0 max=1 step=0.01></label><label title="Bestrafung, wenn ein Token bereits vorkam; positive Werte reduzieren Wiederholungen.">Presence penalty<input id=presence_penalty type=number value=1.5 min=-2 max=2 step=0.05></label><label title="Zusätzliche Häufigkeitsstrafe abhängig davon, wie oft ein Token vorkam.">Frequency penalty<input id=frequency_penalty type=number value=0 min=-2 max=2 step=0.05></label><label title="Grundlegende Wiederholungsstrafe. 1 deaktiviert sie.">Repeat penalty<input id=repeat_penalty type=number value=1 min=0.000001 max=100 step=0.01></label></div><button data-action=runtime onclick="act('runtime')">Runtime-Parameter übernehmen</button></section>
+<section><h2>NVMe und Server</h2><div class=grid><label title="Maximaler Speicherplatz für ausgelagerte K/V-Daten auf NVMe.">NVMe-Budget (GiB)<input id=nvme_gb type=number value=64 min=0 step=0.5></label><label title="Ordner für den NVMe-Cache. Er muss auf dem gewünschten Laufwerk liegen.">NVMe-Verzeichnis<input id=nvme_dir></label><label title="Lokaler HTTP-Port des KVMem-Servers.">Port<input id=port type=number value=18200 min=1 max=65535></label></div><label title="Wenn aktiv, dürfen K/V-Daten auf NVMe ausgelagert werden." style="display:block;margin-top:10px"><input id=raw_k type=checkbox checked> K/V auf NVMe auslagern</label><label title="Schaltet den KVMem-Retrieval-/Speicherpfad ein." style="display:block"><input id=kvmem type=checkbox checked> KVMem aktivieren</label><p><small><b>Vorschau (nur anzeigen)</b> zeigt den aufgelösten Startbefehl und ändert keinen Server. <b>Starten</b> fährt den Server hoch, <b>Neu starten</b> ersetzt einen laufenden KVMem-Server, <b>Stoppen</b> beendet ihn.</small></p><button data-action=preview onclick="act('preview')">Vorschau (nur anzeigen)</button><button data-action=start onclick="act('start')">Starten</button><button data-action=restart onclick="act('restart')" class=warn>Neu starten</button><button data-action=stop onclick="act('stop')" class=stop>Stoppen</button></section>
+<section><h2>Chat</h2><p><small>Open WebUI wird lokal mit Python eingerichtet und auf Port 3000 gestartet. Beim ersten Start kann die Installation einige Minuten dauern. In Open WebUI findest du den Regler unter <b>Controls → Erweiterte Parameter → Reasoning Effort</b>. Das Dashboard setzt die Modellvorgabe beim Start; Sampling und Reasoning Effort können danach über „Runtime-Parameter übernehmen“ für die nächste Anfrage geändert werden.</small></p><button data-action=openwebui onclick="act('openwebui')">Open WebUI einrichten und öffnen</button><button data-action=openwebui_stop class=stop onclick="act('openwebui_stop')">Open WebUI stoppen</button></section>
 <section><h2>Live-Status</h2><div class=cards><div class=card>Phase<b id=phase>–</b><small id=activity>–</small></div><div class=card>Kontext<b id=context_fill>–</b><small id=context_meta>–</small></div><div class=card>Prefill<b id=prefill_speed>–</b><small id=prefill_meta>–</small></div><div class=card>Decode<b id=toks>–</b><small id=decode_meta>tok/s aus Server-Log</small></div><div class=card>Gesamt<b id=total_speed>–</b><small id=mtp_meta>–</small></div><div class=card>GPU<b id=vram>–</b><small id=gpuutil>–</small></div><div class=card>RAM<b id=ram>–</b><small id=processmem>Prozess: –</small></div><div class=card>NVMe<b id=nvme>–</b><small id=nvmefree>–</small></div></div><details open><summary>Letztes Serverereignis</summary><pre id=event>–</pre></details><details><summary>Technische Details</summary><pre id=details>–</pre></details></section>
 <section><h2>Server-Log / Terminal-Ausgabe</h2><p><small>Kontext zeigt Prompt plus bereits erzeugte Tokens; Prefill ist die Verarbeitung der Eingabe, Decode die laufende Ausgabe, Gesamt umfasst beides. GPU-Speicher kann beim Laden bereits voll sein; entscheidend ist, dass Phase und Metriken weiterlaufen. „CUDA Graph … reused“ ist eine normale Wiederverwendung und kein Fehler.</small></p><pre id=output>–</pre></section>
 <script>
@@ -606,8 +706,8 @@ let actionRunning=false, statusTimer=0;
 let catalog=[];
 function compatibility(){let n=$('model').selectedOptions[0]?.textContent.toLowerCase()||'',r=$('recipe').value;if((n.includes('iq4')&&r==='iq3')||(n.includes('iq3')&&r==='iq4'))$('compat').innerHTML='<small>Hinweis: Modell und Rezept haben unterschiedliche IQ-Stufen. Das ist technisch möglich, aber das passende Profil ist als Ausgangspunkt empfohlen.</small>';else $('compat').innerHTML='<small>Modell und Rezept passen als Laufzeitprofil zusammen.</small>'}
 function fill(defaults){let m=catalog.filter(x=>!x.mmproj),p=catalog.filter(x=>x.mmproj),e=x=>x.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); $('model').innerHTML=m.map(x=>`<option value="${e(x.path)}">${e(x.name)}</option>`).join(''); $('mmproj').innerHTML='<option value="">Text-only (kein Projektor)</option>'+p.map(x=>`<option value="${e(x.path)}">${e(x.name)}</option>`).join(''); if(defaults?.model)$('model').value=defaults.model;if(defaults?.mmproj)$('mmproj').value=defaults.mmproj;let n=$('model').selectedOptions[0]?.textContent.toLowerCase()||'';if(n.includes('iq4')||n.includes('ud-iq4')){$('recipe').value='iq4';$('kv').value='q5_0';$('budget').value='32768';$('reserve').value='12288';$('mtp').value='on'}else if(n.includes('iq3')){$('recipe').value='iq3';$('kv').value='q8_0';$('budget').value='36864';$('reserve').value='16384';$('mtp').value='off'}$('model').onchange=compatibility;$('recipe').onchange=compatibility;compatibility()}
-async function load(){let x=await q('/api/models');catalog=x.models;fill(x.defaults); let g=await q('/api/gpus'); $('gpu').innerHTML='<option value="auto">automatisch</option>'+g.gpus.map(x=>`<option value="${x.index}">${x.index}: ${x.name} (${x.memory_mb} MB)</option>`).join(''); $('nvme_dir').value='cache/nvme'; status()}
-function config(){return {action:'',recipe:$('recipe').value,model:$('model').value,mmproj:$('mmproj').value,vision:$('vision').value,gpu:$('gpu').value,kv:$('kv').value,thinking:$('thinking').value,context:$('context').value,budget:$('budget').value,reserve:$('reserve').value,block:$('block').value,draft_max:$('draft_max').value,mtp:$('mtp').value,method:$('method').value,replay:$('replay').value,policy:$('policy').value,nvme_gb:$('nvme_gb').value,nvme_dir:$('nvme_dir').value,port:$('port').value,raw_k:$('raw_k').checked,kvmem:$('kvmem').checked}}
+async function load(){let x=await q('/api/models');catalog=x.models;fill(x.defaults); let p=await q('/api/props'),s=p.default_generation_settings?.params||p.kvmem?.sampling?.non_thinking||{},d=p.kvmem?.defaults||{},e=d.chat_template_kwargs?.reasoning_effort;$('temperature').value=s.temperature??0.7;$('top_p').value=s.top_p??0.8;$('top_k').value=s.top_k??20;$('min_p').value=s.min_p??0;$('presence_penalty').value=s.presence_penalty??1.5;$('frequency_penalty').value=s.frequency_penalty??0;$('repeat_penalty').value=s.repeat_penalty??1;$('thinking').value=e||((d.enable_thinking)?'default':'none'); let g=await q('/api/gpus'); $('gpu').innerHTML='<option value="auto">automatisch</option>'+g.gpus.map(x=>`<option value="${x.index}">${x.index}: ${x.name} (${x.memory_mb} MB)</option>`).join(''); $('nvme_dir').value='cache/nvme'; status()}
+function config(){return {action:'',recipe:$('recipe').value,model:$('model').value,mmproj:$('mmproj').value,vision:$('vision').value,gpu:$('gpu').value,kv:$('kv').value,thinking:$('thinking').value,temperature:$('temperature').value,top_p:$('top_p').value,top_k:$('top_k').value,min_p:$('min_p').value,presence_penalty:$('presence_penalty').value,frequency_penalty:$('frequency_penalty').value,repeat_penalty:$('repeat_penalty').value,context:$('context').value,budget:$('budget').value,reserve:$('reserve').value,block:$('block').value,draft_max:$('draft_max').value,mtp:$('mtp').value,method:$('method').value,replay:$('replay').value,policy:$('policy').value,nvme_gb:$('nvme_gb').value,nvme_dir:$('nvme_dir').value,port:$('port').value,raw_k:$('raw_k').checked,kvmem:$('kvmem').checked}}
 async function openWebUI(chat){for(let i=0;i<900;i++){await new Promise(resolve=>setTimeout(resolve,1000));let x=await q('/api/status');if(x.job&&x.job.action==='openwebui'&&!x.job.running){if(x.job.returncode===0){let w=await q('/api/openwebui');if(w.ready){chat.location.href=w.url;return}}chat?.close();if(x.job.returncode!==0)alert('Open WebUI konnte nicht gestartet werden:\n'+(x.job.output||'Unbekannter Fehler'));return}}chat?.close();alert('Open WebUI braucht ungewöhnlich lange. Details stehen im Status/Log.')}
 async function waitJob(action){for(let i=0;i<480;i++){await new Promise(resolve=>setTimeout(resolve,500));let x=await q('/api/status');if(x.job&&x.job.action===action&&!x.job.running)return x.job}return null}
 async function act(action){if(actionRunning)return;let c=config();c.action=action;let chat=action==='openwebui'?window.open('about:blank','_blank'):null;actionRunning=true;document.querySelectorAll('[data-action]').forEach(x=>x.disabled=true);$('state').textContent=action==='preview'?'Vorschau wird erstellt …':'Aktion läuft: '+action+' …';try{let r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});let x=await r.json();if(!r.ok){chat?.close();alert(x.error)}else if(action==='openwebui')await openWebUI(chat);else await waitJob(action);}catch(e){chat?.close();alert('Dashboard-Verbindung fehlgeschlagen: '+e)}finally{actionRunning=false;document.querySelectorAll('[data-action]').forEach(x=>x.disabled=false);status()}}
@@ -618,6 +718,7 @@ load();
 
 
 def main():
+    start_terminal_cleanup()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://{HOST}:{PORT}/"
     print(f"KVMem dashboard: {url}", flush=True)

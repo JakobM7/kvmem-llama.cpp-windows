@@ -172,6 +172,7 @@ struct MultimodalQuery {
 
 struct ServerState {
     std::mutex mu;
+    std::mutex config_mu;
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -1833,25 +1834,89 @@ int main(int argc, char ** argv) {
     if (!kvmem_mount_ui(svr, ui_dir, no_ui, argv[0])) return 1;
     const int generation_limit = st.kparams.enabled && st.kparams.gen_reserve > 0 ?
         std::min(n_ctx, (int) st.kparams.gen_reserve) : n_ctx;
-    json kwargs = json::object();
-    for (const auto & item : st.template_kwargs) kwargs[item.first] = json::parse(item.second);
-    const auto thinking_params = kvmem_ui_sampling(true, st.sampling_overrides);
-    const auto plain_params = kvmem_ui_sampling(false, st.sampling_overrides);
-    auto default_params = st.enable_thinking_default ? thinking_params : plain_params;
-    default_params["n_predict"] = std::min(st.n_predict_default > 0 ? st.n_predict_default : generation_limit, generation_limit);
-    default_params["max_tokens"] = default_params["n_predict"];
-    const json props = {
-        {"role", "model"}, {"total_slots", 1}, {"model_name", st.model_name},
-        {"default_generation_settings", {{"n_ctx", n_ctx}, {"params", default_params}}},
-        {"modalities", {{"vision", st.vision != nullptr}, {"audio", false}, {"video", false}}},
-        {"kvmem", {{"generation_limit", generation_limit},
-            {"defaults", {{"enable_thinking", st.enable_thinking_default},
-                          {"reasoning_budget_tokens", st.reasoning_budget_default}, {"chat_template_kwargs", kwargs}}},
-            {"sampling", {{"thinking", thinking_params}, {"non_thinking", plain_params}}}}}
+    auto make_props = [&]() {
+        json kwargs = json::object();
+        for (const auto & item : st.template_kwargs) kwargs[item.first] = json::parse(item.second);
+        const auto thinking_params = kvmem_ui_sampling(true, st.sampling_overrides);
+        const auto plain_params = kvmem_ui_sampling(false, st.sampling_overrides);
+        auto default_params = st.enable_thinking_default ? thinking_params : plain_params;
+        default_params["n_predict"] = std::min(st.n_predict_default > 0 ? st.n_predict_default : generation_limit, generation_limit);
+        default_params["max_tokens"] = default_params["n_predict"];
+        return json{
+            {"role", "model"}, {"total_slots", 1}, {"model_name", st.model_name},
+            {"default_generation_settings", {{"n_ctx", n_ctx}, {"params", default_params}}},
+            {"modalities", {{"vision", st.vision != nullptr}, {"audio", false}, {"video", false}}},
+            {"kvmem", {{"generation_limit", generation_limit},
+                {"defaults", {{"enable_thinking", st.enable_thinking_default},
+                              {"reasoning_budget_tokens", st.reasoning_budget_default}, {"chat_template_kwargs", kwargs}}},
+                {"sampling", {{"thinking", thinking_params}, {"non_thinking", plain_params}}}}}
+        };
     };
-    svr.Get("/props", [props](const httplib::Request &, httplib::Response & res) {
+    svr.Get("/props", [&](const httplib::Request &, httplib::Response & res) {
+        std::lock_guard<std::mutex> lock(st.config_mu);
         res.set_header("Cache-Control", "no-store");
-        res.set_content(props.dump(), "application/json");
+        res.set_content(make_props().dump(), "application/json");
+    });
+    svr.Post("/props", [&](const httplib::Request & req, httplib::Response & res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception & e) {
+            res.status = 400;
+            res.set_content(json{{"error", std::string("invalid JSON: ") + e.what()}}.dump(), "application/json");
+            return;
+        }
+        if (!body.is_object()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"runtime defaults must be a JSON object\"}", "application/json");
+            return;
+        }
+        std::lock_guard<std::mutex> lock(st.config_mu);
+        std::string err;
+        json sampling = st.sampling_overrides;
+        for (const char * key : {"temperature", "top_p", "top_k", "min_p", "presence_penalty",
+                                 "frequency_penalty", "repeat_penalty", "repetition_penalty", "seed"}) {
+            if (body.contains(key)) {
+                if (body[key].is_null()) sampling.erase(key);
+                else sampling[key] = body[key];
+            }
+        }
+        auto sampling_check = kvmem_chat_sampling_defaults(st.enable_thinking_default);
+        if (!kvmem_chat_sampling_override(sampling, sampling_check, err)) {
+            res.status = 400;
+            res.set_content(json{{"error", err}}.dump(), "application/json");
+            return;
+        }
+        bool thinking = st.enable_thinking_default;
+        auto kwargs = st.template_kwargs;
+        json template_body = json::object();
+        if (body.contains("reasoning_effort")) {
+            template_body["reasoning_effort"] = body["reasoning_effort"];
+            if (!body.contains("enable_thinking")) {
+                template_body["enable_thinking"] = body["reasoning_effort"] != "none";
+            }
+        }
+        if (body.contains("enable_thinking")) template_body["enable_thinking"] = body["enable_thinking"];
+        if (!kvmem_chat_template_override(template_body, thinking, kwargs, err)) {
+            res.status = 400;
+            res.set_content(json{{"error", err}}.dump(), "application/json");
+            return;
+        }
+        int budget = st.reasoning_budget_default;
+        if (body.contains("reasoning_effort") && !body.contains("reasoning_budget_tokens")) {
+            budget = body["reasoning_effort"] == "none" ? 0 : -1;
+        }
+        if (!kvmem_chat_reasoning_budget_override(body, budget, err)) {
+            res.status = 400;
+            res.set_content(json{{"error", err}}.dump(), "application/json");
+            return;
+        }
+        st.sampling_overrides = std::move(sampling);
+        st.enable_thinking_default = thinking;
+        st.template_kwargs = std::move(kwargs);
+        st.reasoning_budget_default = budget;
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(make_props().dump(), "application/json");
     });
     svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
         res.set_content("{\"status\":\"ok\"}", "application/json");
@@ -1875,11 +1940,16 @@ int main(int argc, char ** argv) {
             return;
         }
         ChatRequest cr;
-        cr.max_tokens = st.n_predict_default;
-        cr.enable_thinking = st.enable_thinking_default;
-        cr.template_kwargs = st.template_kwargs;
-        cr.reasoning_budget_tokens = st.reasoning_budget_default;
-        cr.reasoning_budget_message = st.reasoning_budget_message;
+        json sampling_overrides;
+        {
+            std::lock_guard<std::mutex> config_lock(st.config_mu);
+            cr.max_tokens = st.n_predict_default;
+            cr.enable_thinking = st.enable_thinking_default;
+            cr.template_kwargs = st.template_kwargs;
+            cr.reasoning_budget_tokens = st.reasoning_budget_default;
+            cr.reasoning_budget_message = st.reasoning_budget_message;
+            sampling_overrides = st.sampling_overrides;
+        }
         std::string err;
         if (!parse_chat_request(body, cr, err) ||
             !kvmem_output_limit(body, generation_limit, cr.max_tokens, err)) {
@@ -1894,7 +1964,7 @@ int main(int argc, char ** argv) {
         }
 
         cr.sampling = kvmem_chat_sampling_defaults(cr.enable_thinking);
-        if (!kvmem_chat_sampling_override(st.sampling_overrides, cr.sampling, err) ||
+        if (!kvmem_chat_sampling_override(sampling_overrides, cr.sampling, err) ||
             !kvmem_chat_sampling_override(body, cr.sampling, err)) {
             res.status = 400;
             res.set_content(json{{"error", err}}.dump(), "application/json");

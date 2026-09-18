@@ -159,11 +159,15 @@ $env:ENABLE_AUTOCOMPLETE_GENERATION = 'false'
 $env:ENABLE_SEARCH_QUERY_GENERATION = 'false'
 $env:ENABLE_RETRIEVAL_QUERY_GENERATION = 'false'
 # Open WebUI forwards these model defaults to llama.cpp.  Only an explicit
-# dashboard thinking profile enables them; the normal "off" profile stays
+# dashboard reasoning profile enables them; the normal "none" profile stays
 # unchanged and does not add reasoning work to chat requests.
-$reasoningBudget = $env:KVMEM_OPENWEBUI_THINKING
-if ($reasoningBudget -in @('256', '1024', '4096')) {
-    $env:DEFAULT_MODEL_PARAMS = '{"chat_template_kwargs":{"enable_thinking":true},"reasoning_budget_tokens":' + $reasoningBudget + '}'
+$reasoningEffort = $env:KVMEM_OPENWEBUI_THINKING
+if ($reasoningEffort -in @('minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')) {
+    $env:DEFAULT_MODEL_PARAMS = '{"chat_template_kwargs":{"enable_thinking":true,"reasoning_effort":"' + $reasoningEffort + '"},"reasoning_budget_tokens":-1}'
+} elseif ($reasoningEffort -eq 'default') {
+    $env:DEFAULT_MODEL_PARAMS = '{"chat_template_kwargs":{"enable_thinking":true},"reasoning_budget_tokens":-1}'
+} elseif ($reasoningEffort -in @('256', '1024', '4096')) {
+    $env:DEFAULT_MODEL_PARAMS = '{"chat_template_kwargs":{"enable_thinking":true},"reasoning_budget_tokens":' + $reasoningEffort + '}'
 } else {
     Remove-Item Env:DEFAULT_MODEL_PARAMS -ErrorAction SilentlyContinue
 }
