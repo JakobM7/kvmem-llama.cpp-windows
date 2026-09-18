@@ -512,7 +512,8 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(length).decode("utf-8"))
             action = data.pop("action", "start")
             if action not in {"start", "restart", "stop", "preview", "openwebui", "openwebui_stop"}: raise ValueError("invalid action")
-            config = ({"port": open_webui_port()} if action in {"openwebui", "openwebui_stop"} else
+            config = (base_config(data) if action == "openwebui" else
+                      {"port": open_webui_port(), "model": ""} if action == "openwebui_stop" else
                       stop_config(data) if action == "stop" else base_config(data))
             with STATE["lock"]:
                 previous = STATE["job"]
