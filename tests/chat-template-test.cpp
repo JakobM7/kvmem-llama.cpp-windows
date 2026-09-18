@@ -20,6 +20,10 @@ static void test_options() {
     CHECK(!kwargs.count("reasoning_effort") && thinking);
     CHECK(kvmem_chat_template_override({{"enable_thinking", true}, {"chat_template_kwargs", {{"enable_thinking", true}, {"reasoning_effort", "low"}}}, {"reasoning_effort", "none"}}, thinking, kwargs, err));
     CHECK(!thinking && kwargs["enable_thinking"] == "false" && !kwargs.count("reasoning_effort"));
+    const std::string limited = R"JINJA({% set reasoning_effort = reasoning_effort | default('xhigh') %}{% if reasoning_effort == 'low' %}low{% elif reasoning_effort == 'medium' %}medium{% elif reasoning_effort == 'xhigh' %}xhigh{% else %}{{ raise_exception('unsupported effort') }}{% endif %})JINJA";
+    kwargs.clear(); thinking = true; err.clear();
+    CHECK(kvmem_chat_template_override({{"reasoning_effort", "max"}}, thinking, kwargs, err, limited));
+    CHECK(kwargs["reasoning_effort"] == "\"xhigh\"");
     CHECK(kvmem_chat_template_override({{"enable_thinking", true}}, thinking, kwargs, err));
     CHECK(thinking && kwargs["enable_thinking"] == "true");
     for (const auto & body : {json{{"chat_template_kwargs", "{}"}}, json{{"chat_template_kwargs", json::array()}},

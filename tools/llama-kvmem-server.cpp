@@ -177,6 +177,7 @@ struct ServerState {
     llama_context * ctx = nullptr;
     const llama_vocab * vocab = nullptr;
     common_chat_templates_ptr tmpls;
+    std::string template_source;
     llama_kvmem_params kparams {};
     int n_batch = 512;
     int n_predict_default = 128;
@@ -1359,7 +1360,8 @@ static bool strip_stop(std::string & content, const std::vector<std::string> & s
     return false;
 }
 
-static bool parse_chat_request(const json & body, ChatRequest & out, std::string & err) {
+static bool parse_chat_request(const json & body, ChatRequest & out, std::string & err,
+                               const std::string & template_source = {}) {
     if (!body.is_object()) {
         err = "request must be a JSON object";
         return false;
@@ -1472,7 +1474,7 @@ static bool parse_chat_request(const json & body, ChatRequest & out, std::string
             }
         }
     }
-    if (!kvmem_chat_template_override(body, out.enable_thinking, out.template_kwargs, err)) {
+    if (!kvmem_chat_template_override(body, out.enable_thinking, out.template_kwargs, err, template_source)) {
         return false;
     }
     if (!kvmem_chat_reasoning_budget_override(body, out.reasoning_budget_tokens, err)) {
@@ -1722,13 +1724,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
     {
-        std::string err;
-        if (!kvmem_chat_template_override(template_defaults, st.enable_thinking_default, st.template_kwargs, err)) {
-            fprintf(stderr, "invalid template defaults: %s\n", err.c_str());
-            return 1;
-        }
-    }
-    {
         const auto slash = model_path.find_last_of("/\\");
         st.model_name = slash == std::string::npos ? model_path : model_path.substr(slash + 1);
     }
@@ -1763,9 +1758,21 @@ int main(int argc, char ** argv) {
     st.vocab = llama_model_get_vocab(st.model);
     try {
         st.tmpls = common_chat_templates_init(st.model, chat_template);
+        st.template_source = common_chat_templates_source(st.tmpls.get());
     } catch (const std::exception & e) {
         fprintf(stderr, "invalid chat template: %s\n", e.what());
         return 1;
+    }
+    {
+        std::string err;
+        std::map<std::string, std::string> normalized;
+        bool thinking = st.enable_thinking_default;
+        if (!kvmem_chat_template_override(template_defaults, thinking, normalized, err, st.template_source)) {
+            fprintf(stderr, "invalid template defaults: %s\n", err.c_str());
+            return 1;
+        }
+        st.enable_thinking_default = thinking;
+        st.template_kwargs = std::move(normalized);
     }
 
     llama_context_params cparams = llama_context_default_params();
@@ -1897,7 +1904,7 @@ int main(int argc, char ** argv) {
             }
         }
         if (body.contains("enable_thinking")) template_body["enable_thinking"] = body["enable_thinking"];
-        if (!kvmem_chat_template_override(template_body, thinking, kwargs, err)) {
+        if (!kvmem_chat_template_override(template_body, thinking, kwargs, err, st.template_source)) {
             res.status = 400;
             res.set_content(json{{"error", err}}.dump(), "application/json");
             return;
@@ -1951,7 +1958,7 @@ int main(int argc, char ** argv) {
             sampling_overrides = st.sampling_overrides;
         }
         std::string err;
-        if (!parse_chat_request(body, cr, err) ||
+        if (!parse_chat_request(body, cr, err, st.template_source) ||
             !kvmem_output_limit(body, generation_limit, cr.max_tokens, err)) {
             res.status = 400;
             res.set_content(json{{"error", err}}.dump(), "application/json");

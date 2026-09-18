@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -390,6 +392,74 @@ def open_webui_ready():
         return False
 
 
+def tail_text(path, limit=8000):
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[-limit:]
+    except OSError:
+        return ""
+
+
+def open_webui_status(job=None):
+    if job is None:
+        with STATE["lock"]:
+            job = dict(STATE["job"]) if STATE["job"] else None
+    port = open_webui_port()
+    pid = None
+    try:
+        pid = int((ROOT / ".open-webui.pid").read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        pass
+    process_running = bool(pid and process_memory(pid))
+    ready = open_webui_ready()
+    action_running = bool(job and job.get("running") and job.get("action") in {"openwebui", "openwebui_stop"})
+    if ready:
+        phase = "läuft"
+    elif action_running and job.get("action") == "openwebui":
+        phase = "wird eingerichtet / gestartet"
+    elif process_running:
+        phase = "Prozess läuft, wartet auf HTTP"
+    else:
+        phase = "nicht aktiv"
+    parts = []
+    if job and job.get("output_tail"):
+        parts.append("[Dashboard-Aktion]\n" + job["output_tail"])
+    parts.append("[OpenWebUI stdout]\n" + tail_text(ROOT / "logs" / "open-webui.stdout.log"))
+    parts.append("[OpenWebUI stderr]\n" + tail_text(ROOT / "logs" / "open-webui.stderr.log"))
+    log = "\n\n".join(part for part in parts if part.strip())[-12000:]
+    return {"ready": ready, "url": f"http://{HOST}:{port}/", "pid": pid,
+            "process_running": process_running, "phase": phase, "log": log,
+            "job_running": action_running,
+            "elapsed_seconds": round(max(0, time.time() - job["started"]), 1)
+            if action_running and job.get("started") else None}
+
+
+def model_reasoning_efforts(path):
+    """Read the model's reasoning levels from its GGUF chat-template metadata."""
+    try:
+        with path.open("rb") as stream:
+            source = stream.read(16 * 1024 * 1024).decode("utf-8", errors="ignore")
+    except OSError:
+        return []
+    values = []
+    for pattern in (r"reasoning_effort\s+not\s+in\s*\(([^)]*)\)",
+                    r"reasoning_effort\s+not\s+in\s*\[([^]]*)\]"):
+        match = re.search(pattern, source)
+        if match:
+            values = re.findall(r"['\"]([^'\"]+)['\"]", match.group(1))
+            if values:
+                break
+    if not values:
+        values = re.findall(r"reasoning_effort\s*==\s*['\"]([^'\"]+)", source)
+    return list(dict.fromkeys(values))
+
+
+def validate_reasoning_effort(model, thinking):
+    supported = model_reasoning_efforts(model)
+    if supported and thinking not in {"none", "default"} and thinking not in supported:
+        allowed = ", ".join(supported)
+        raise ValueError(f"Dieses GGUF unterstützt nur: none, default, {allowed}")
+
+
 def base_config(data):
     defaults = default_models()
     recipe = str(data.get("recipe", "iq3"))
@@ -433,6 +503,7 @@ def base_config(data):
     if thinking not in {"none", "default", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
                         "256", "1024", "4096"}:
         raise ValueError("reasoning effort must be none, default, minimal, low, medium, high, xhigh, max or ultra")
+    validate_reasoning_effort(model, thinking)
     nvme_dir = str(data.get("nvme_dir", str(ROOT / "cache" / "nvme"))).strip()
     if not nvme_dir:
         nvme_dir = str(ROOT / "cache" / "nvme")
@@ -491,6 +562,9 @@ def runtime_config(data):
         thinking = "none"
     if thinking not in {"none", "default", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
         raise ValueError("reasoning effort must be none, default, minimal, low, medium, high, xhigh, max or ultra")
+    model_value = str(data.get("model", "")).strip()
+    if model_value:
+        validate_reasoning_effort(allowed_gguf(model_value), thinking)
     return {
         "port": port, "thinking": thinking,
         "temperature": number("temperature", 0.7, 0, 2),
@@ -586,9 +660,11 @@ def apply_runtime(config):
 
 def run_job(config, action):
     proc = None
+    output_text = ""
     try:
         if action == "runtime":
-            result = {"action": action, "returncode": 0, "output": apply_runtime(config), "config": config}
+            output_text = apply_runtime(config)
+            result = {"action": action, "returncode": 0, "output": output_text, "config": config}
         else:
             argv, env = command(config, action)
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
@@ -597,8 +673,34 @@ def run_job(config, action):
             # The launcher starts the actual server detached.  A stuck launcher must
             # not keep the dashboard's single-action slot occupied indefinitely.
             timeout = 900 if action == "openwebui" else 240
-            output, _ = proc.communicate(timeout=timeout)
-            result = {"action": action, "returncode": proc.returncode, "output": output[-8000:], "config": config}
+            output_queue = queue.Queue()
+            def read_output():
+                try:
+                    for line in proc.stdout:
+                        output_queue.put(line)
+                finally:
+                    output_queue.put(None)
+            threading.Thread(target=read_output, daemon=True).start()
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, timeout, output=output_text)
+                try:
+                    line = output_queue.get(timeout=min(0.25, remaining))
+                except queue.Empty:
+                    continue
+                if line is None:
+                    if proc.poll() is not None:
+                        break
+                    continue
+                output_text = (output_text + line)[-8000:]
+                with STATE["lock"]:
+                    current = STATE["job"]
+                    if current and current.get("running") and current.get("action") == action:
+                        current["output_tail"] = output_text
+            proc.wait(timeout=5)
+            result = {"action": action, "returncode": proc.returncode, "output": output_text, "output_tail": output_text, "config": config}
     except subprocess.TimeoutExpired:
         if proc is not None and proc.poll() is None:
             proc.terminate()
@@ -609,9 +711,11 @@ def run_job(config, action):
                 proc.wait(timeout=5)
         result = {"action": action, "returncode": 1,
                   "output": f"Die Aktion wurde nach {timeout} Sekunden abgebrochen. "
-                            "Prüfe den Server-Log und starte sie danach erneut.", "config": config}
+                            "Prüfe den Server-Log und starte sie danach erneut.",
+                  "output_tail": output_text, "config": config}
     except Exception as exc:  # surface failures in the dashboard instead of taking down its server
-        result = {"action": action, "returncode": 1, "output": str(exc), "config": config}
+        result = {"action": action, "returncode": 1, "output": str(exc),
+                  "output_tail": output_text, "config": config}
     with STATE["lock"]:
         STATE["job"] = {"running": False, **result}
 
@@ -648,7 +752,8 @@ class Handler(BaseHTTPRequestHandler):
             port = 18200
             if job and job.get("config"): port = job["config"].get("port", port)
             self.send_json({"health": server_json(port, "/health"), "models": server_json(port, "/v1/models"),
-                            "job": job, "logs": tail_logs(), "telemetry": telemetry(job.get("config") if job else None)}); return
+                            "job": job, "logs": tail_logs(), "openwebui": open_webui_status(job),
+                            "telemetry": telemetry(job.get("config") if job else None)}); return
         if self.path == "/api/props":
             state = latest_server_state()
             argv = state.get("argv", []) if state else []
@@ -657,9 +762,17 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, IndexError):
                 port = 18200
             self.send_json(server_json(port, "/props") or {}); return
+        if urllib.parse.urlsplit(self.path).path == "/api/model-capabilities":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            value = query.get("path", [""])[0]
+            try:
+                path = allowed_gguf(value)
+                self.send_json({"reasoning_efforts": model_reasoning_efforts(path), "source": "gguf"})
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, 400)
+            return
         if self.path == "/api/openwebui":
-            port = open_webui_port()
-            self.send_json({"ready": open_webui_ready(), "url": f"http://{HOST}:{port}/"}); return
+            self.send_json(open_webui_status()); return
         self.send_json({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -697,7 +810,7 @@ body{font:14px system-ui,sans-serif;background:#10131a;color:#e8edf5;max-width:1
 <section><h2>Kontext und KVMem</h2><div class=grid><label title="Maximale Promptlänge inklusive Historie">Kontext (Tokens)<input id=context type=number value=262144 min=1></label><label title="GPU-KV-Fenster für Retrieval; größer = mehr VRAM">Retrieval-Budget<input id=budget type=number value=36864 min=1></label><label title="Reservierte Slots für die Antwort; muss zur erwarteten Antwortlänge passen">Generierungsreserve<input id=reserve type=number value=16384 min=1></label><label title="Tokens je KVMem-Block; kleiner ist feiner, aber langsamer">Blockgröße<input id=block type=number value=128 min=1></label><label title="MTP erzeugt Entwürfe und kann Decode beschleunigen">MTP<select id=mtp><option value=on>an</option><option value=off>aus</option></select></label><label title="Anzahl vorgeschlagener Tokens pro MTP-Schritt">MTP-Draft-Länge<input id=draft_max type=number value=3 min=1 max=5></label><label title="retrieval holt relevante Blöcke, recency bevorzugt die jüngsten">Retrieval-Methode<select id=method><option>retrieval</option><option>recency</option></select></label><label title="Automatisch optimiert Wiederverwendung; legacy ist Kompatibilitätsmodus">Query-Replay<select id=replay><option>auto</option><option>legacy</option></select></label><label title="user nutzt die letzte Nutzerfrage als Query">Query-Policy<select id=policy><option>user</option><option>legacy</option></select></label></div></section>
 <section><h2>Sampling / Runtime-Defaults</h2><p><small>Diese Werte werden mit <b>Runtime-Parameter übernehmen</b> ohne Modell-Neustart für die nächste Anfrage gesetzt. Explizite Werte aus OpenWebUI oder einer API-Anfrage haben Vorrang.</small></p><div class=grid><label title="Zufallsvariation: 0 ist greedy, höhere Werte machen Antworten variabler.">Temperature<input id=temperature type=number value=0.7 min=0 max=2 step=0.05></label><label title="Nucleus-Sampling: berücksichtigt nur die wahrscheinlichsten Tokens bis zu dieser kumulierten Wahrscheinlichkeit.">Top-p<input id=top_p type=number value=0.8 min=0 max=1 step=0.01></label><label title="Begrenzt die Auswahl auf die K wahrscheinlichsten Tokens. 0 deaktiviert diese Begrenzung.">Top-k<input id=top_k type=number value=20 min=0 step=1></label><label title="Verwirft Tokens unterhalb dieses relativen Wahrscheinlichkeitsanteils.">Min-p<input id=min_p type=number value=0 min=0 max=1 step=0.01></label><label title="Bestrafung, wenn ein Token bereits vorkam; positive Werte reduzieren Wiederholungen.">Presence penalty<input id=presence_penalty type=number value=1.5 min=-2 max=2 step=0.05></label><label title="Zusätzliche Häufigkeitsstrafe abhängig davon, wie oft ein Token vorkam.">Frequency penalty<input id=frequency_penalty type=number value=0 min=-2 max=2 step=0.05></label><label title="Grundlegende Wiederholungsstrafe. 1 deaktiviert sie.">Repeat penalty<input id=repeat_penalty type=number value=1 min=0.000001 max=100 step=0.01></label></div><button data-action=runtime onclick="act('runtime')">Runtime-Parameter übernehmen</button></section>
 <section><h2>NVMe und Server</h2><div class=grid><label title="Maximaler Speicherplatz für ausgelagerte K/V-Daten auf NVMe.">NVMe-Budget (GiB)<input id=nvme_gb type=number value=64 min=0 step=0.5></label><label title="Ordner für den NVMe-Cache. Er muss auf dem gewünschten Laufwerk liegen.">NVMe-Verzeichnis<input id=nvme_dir></label><label title="Lokaler HTTP-Port des KVMem-Servers.">Port<input id=port type=number value=18200 min=1 max=65535></label></div><label title="Wenn aktiv, dürfen K/V-Daten auf NVMe ausgelagert werden." style="display:block;margin-top:10px"><input id=raw_k type=checkbox checked> K/V auf NVMe auslagern</label><label title="Schaltet den KVMem-Retrieval-/Speicherpfad ein." style="display:block"><input id=kvmem type=checkbox checked> KVMem aktivieren</label><p><small><b>Vorschau (nur anzeigen)</b> zeigt den aufgelösten Startbefehl und ändert keinen Server. <b>Starten</b> fährt den Server hoch, <b>Neu starten</b> ersetzt einen laufenden KVMem-Server, <b>Stoppen</b> beendet ihn.</small></p><button data-action=preview onclick="act('preview')">Vorschau (nur anzeigen)</button><button data-action=start onclick="act('start')">Starten</button><button data-action=restart onclick="act('restart')" class=warn>Neu starten</button><button data-action=stop onclick="act('stop')" class=stop>Stoppen</button></section>
-<section><h2>Chat</h2><p><small>Open WebUI wird lokal mit Python eingerichtet und auf Port 3000 gestartet. Beim ersten Start kann die Installation einige Minuten dauern. Starte sie zuerst und öffne sie danach separat; so landet der Öffnen-Button nicht auf einer leeren about:blank-Seite.</small></p><button data-action=openwebui onclick="act('openwebui')">Open WebUI starten / einrichten</button><button onclick="openWebUI()">Open WebUI öffnen</button><button data-action=openwebui_stop class=stop onclick="act('openwebui_stop')">Open WebUI stoppen</button></section>
+<section><h2>Chat</h2><p><small>Open WebUI wird lokal mit Python eingerichtet und auf Port 3000 gestartet. Beim ersten Start kann die Installation einige Minuten dauern. Der Status und die laufende Ausgabe stehen hier direkt darunter.</small></p><p><b id=webui_phase>Open WebUI: –</b> <small id=webui_meta>–</small></p><details open><summary>Open WebUI-Konsole</summary><pre id=webui_output>–</pre></details><button data-action=openwebui onclick="act('openwebui')">Open WebUI starten / einrichten</button><button onclick="openWebUI()">Open WebUI öffnen</button><button data-action=openwebui_stop class=stop onclick="act('openwebui_stop')">Open WebUI stoppen</button></section>
 <section><h2>Live-Status</h2><div class=cards><div class=card>Phase<b id=phase>–</b><small id=activity>–</small></div><div class=card>Kontext<b id=context_fill>–</b><small id=context_meta>–</small></div><div class=card>Prefill<b id=prefill_speed>–</b><small id=prefill_meta>–</small></div><div class=card>Decode<b id=toks>–</b><small id=decode_meta>tok/s aus Server-Log</small></div><div class=card>Gesamt<b id=total_speed>–</b><small id=mtp_meta>–</small></div><div class=card>GPU<b id=vram>–</b><small id=gpuutil>–</small></div><div class=card>RAM<b id=ram>–</b><small id=processmem>Prozess: –</small></div><div class=card>NVMe<b id=nvme>–</b><small id=nvmefree>–</small></div></div><details open><summary>Letztes Serverereignis</summary><pre id=event>–</pre></details><details><summary>Technische Details</summary><pre id=details>–</pre></details></section>
 <section><h2>Server-Log / Terminal-Ausgabe</h2><p><small>Kontext zeigt Prompt plus bereits erzeugte Tokens; Prefill ist die Verarbeitung der Eingabe, Decode die laufende Ausgabe, Gesamt umfasst beides. GPU-Speicher kann beim Laden bereits voll sein; entscheidend ist, dass Phase und Metriken weiterlaufen. „CUDA Graph … reused“ ist eine normale Wiederverwendung und kein Fehler.</small></p><pre id=output>–</pre></section>
 <script>
@@ -707,16 +820,20 @@ const thinkingLabel=$('thinking')?.parentElement;if(thinkingLabel){thinkingLabel
 let actionRunning=false, statusTimer=0;
 let catalog=[];
 function compatibility(){let n=$('model').selectedOptions[0]?.textContent.toLowerCase()||'',r=$('recipe').value;if((n.includes('iq4')&&r==='iq3')||(n.includes('iq3')&&r==='iq4'))$('compat').innerHTML='<small>Hinweis: Modell und Rezept haben unterschiedliche IQ-Stufen. Das ist technisch möglich, aber das passende Profil ist als Ausgangspunkt empfohlen.</small>';else $('compat').innerHTML='<small>Modell und Rezept passen als Laufzeitprofil zusammen.</small>'}
-function fill(defaults){let m=catalog.filter(x=>!x.mmproj),p=catalog.filter(x=>x.mmproj),e=x=>x.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); $('model').innerHTML=m.map(x=>`<option value="${e(x.path)}">${e(x.name)}</option>`).join(''); $('mmproj').innerHTML='<option value="">Text-only (kein Projektor)</option>'+p.map(x=>`<option value="${e(x.path)}">${e(x.name)}</option>`).join(''); if(defaults?.model)$('model').value=defaults.model;if(defaults?.mmproj)$('mmproj').value=defaults.mmproj;let n=$('model').selectedOptions[0]?.textContent.toLowerCase()||'';if(n.includes('iq4')||n.includes('ud-iq4')){$('recipe').value='iq4';$('kv').value='q5_0';$('budget').value='32768';$('reserve').value='12288';$('mtp').value='on'}else if(n.includes('iq3')){$('recipe').value='iq3';$('kv').value='q8_0';$('budget').value='36864';$('reserve').value='16384';$('mtp').value='off'}$('model').onchange=compatibility;$('recipe').onchange=compatibility;compatibility()}
-async function load(){let x=await q('/api/models');catalog=x.models;fill(x.defaults); let p=await q('/api/props'),s=p.default_generation_settings?.params||p.kvmem?.sampling?.non_thinking||{},d=p.kvmem?.defaults||{},e=d.chat_template_kwargs?.reasoning_effort;$('temperature').value=s.temperature??0.7;$('top_p').value=s.top_p??0.8;$('top_k').value=s.top_k??20;$('min_p').value=s.min_p??0;$('presence_penalty').value=s.presence_penalty??1.5;$('frequency_penalty').value=s.frequency_penalty??0;$('repeat_penalty').value=s.repeat_penalty??1;$('thinking').value=e||((d.enable_thinking)?'default':'none'); let g=await q('/api/gpus'); $('gpu').innerHTML='<option value="auto">automatisch</option>'+g.gpus.map(x=>`<option value="${x.index}">${x.index}: ${x.name} (${x.memory_mb} MB)</option>`).join(''); $('nvme_dir').value='cache/nvme'; status()}
+function setReasoningOptions(levels){let select=$('thinking'),current=select.value,known=['none','default',...(levels||[])].filter((x,i,a)=>a.indexOf(x)===i);select.innerHTML=known.map(x=>`<option value="${x}">${x==='none'?'none · ohne Thinking':x==='default'?'default · Modellvorgabe':x}</option>`).join('');select.value=known.includes(current)?current:'default'}
+async function capabilities(){let model=$('model')?.value;if(!model)return;try{let x=await q('/api/model-capabilities?path='+encodeURIComponent(model));setReasoningOptions(x.reasoning_efforts)}catch{setReasoningOptions()}}
+function fill(defaults){let m=catalog.filter(x=>!x.mmproj),p=catalog.filter(x=>x.mmproj),e=x=>x.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); $('model').innerHTML=m.map(x=>`<option value="${e(x.path)}">${e(x.name)}</option>`).join(''); $('mmproj').innerHTML='<option value="">Text-only (kein Projektor)</option>'+p.map(x=>`<option value="${e(x.path)}">${e(x.name)}</option>`).join(''); if(defaults?.model)$('model').value=defaults.model;if(defaults?.mmproj)$('mmproj').value=defaults.mmproj;let n=$('model').selectedOptions[0]?.textContent.toLowerCase()||'';if(n.includes('iq4')||n.includes('ud-iq4')){$('recipe').value='iq4';$('kv').value='q5_0';$('budget').value='32768';$('reserve').value='12288';$('mtp').value='on'}else if(n.includes('iq3')){$('recipe').value='iq3';$('kv').value='q8_0';$('budget').value='36864';$('reserve').value='16384';$('mtp').value='off'}$('model').onchange=()=>{compatibility();capabilities()};$('recipe').onchange=compatibility;compatibility()}
+async function load(){let x=await q('/api/models');catalog=x.models;fill(x.defaults); let p=await q('/api/props'),s=p.default_generation_settings?.params||p.kvmem?.sampling?.non_thinking||{},d=p.kvmem?.defaults||{},e=d.chat_template_kwargs?.reasoning_effort;$('temperature').value=s.temperature??0.7;$('top_p').value=s.top_p??0.8;$('top_k').value=s.top_k??20;$('min_p').value=s.min_p??0;$('presence_penalty').value=s.presence_penalty??1.5;$('frequency_penalty').value=s.frequency_penalty??0;$('repeat_penalty').value=s.repeat_penalty??1;$('thinking').value=e||((d.enable_thinking)?'default':'none'); let g=await q('/api/gpus'); $('gpu').innerHTML='<option value="auto">automatisch</option>'+g.gpus.map(x=>`<option value="${x.index}">${x.index}: ${x.name} (${x.memory_mb} MB)</option>`).join(''); $('nvme_dir').value='cache/nvme'; capabilities(); status()}
 function config(){return {action:'',recipe:$('recipe').value,model:$('model').value,mmproj:$('mmproj').value,vision:$('vision').value,gpu:$('gpu').value,kv:$('kv').value,thinking:$('thinking').value,temperature:$('temperature').value,top_p:$('top_p').value,top_k:$('top_k').value,min_p:$('min_p').value,presence_penalty:$('presence_penalty').value,frequency_penalty:$('frequency_penalty').value,repeat_penalty:$('repeat_penalty').value,context:$('context').value,budget:$('budget').value,reserve:$('reserve').value,block:$('block').value,draft_max:$('draft_max').value,mtp:$('mtp').value,method:$('method').value,replay:$('replay').value,policy:$('policy').value,nvme_gb:$('nvme_gb').value,nvme_dir:$('nvme_dir').value,port:$('port').value,raw_k:$('raw_k').checked,kvmem:$('kvmem').checked}}
 async function waitForWebUI(){for(let i=0;i<900;i++){await new Promise(resolve=>setTimeout(resolve,1000));let x=await q('/api/status');if(x.job&&x.job.action==='openwebui'&&!x.job.running){if(x.job.returncode===0){$('state').textContent='Open WebUI läuft';return}alert('Open WebUI konnte nicht gestartet werden:\n'+(x.job.output||'Unbekannter Fehler'));return}}alert('Open WebUI braucht ungewöhnlich lange. Details stehen im Status/Log.')}
-async function openWebUI(){try{let w=await q('/api/openwebui');if(!w.ready){alert('Open WebUI läuft noch nicht. Bitte zuerst „Open WebUI starten / einrichten“ ausführen.');return}let tab=window.open(w.url,'_blank','noopener');if(!tab)window.location.href=w.url}catch(e){alert('Open WebUI konnte nicht geöffnet werden: '+e)}}
+async function openWebUI(){try{let w=await q('/api/openwebui');let tab=window.open(w.url,'_blank','noopener');if(!tab)window.location.href=w.url;if(!w.ready)$('state').textContent='Open WebUI ist noch nicht bereit – die Seite bleibt geöffnet.'}catch(e){alert('Open WebUI konnte nicht geöffnet werden: '+e)}}
 async function waitJob(action){for(let i=0;i<480;i++){await new Promise(resolve=>setTimeout(resolve,500));let x=await q('/api/status');if(x.job&&x.job.action===action&&!x.job.running)return x.job}return null}
 async function act(action){if(actionRunning)return;let c=config();c.action=action;actionRunning=true;document.querySelectorAll('[data-action]').forEach(x=>x.disabled=true);$('state').textContent=action==='preview'?'Vorschau wird erstellt …':'Aktion läuft: '+action+' …';try{let r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});let x=await r.json();if(!r.ok)alert(x.error);else if(action==='openwebui')await waitForWebUI();else await waitJob(action);}catch(e){alert('Dashboard-Verbindung fehlgeschlagen: '+e)}finally{actionRunning=false;document.querySelectorAll('[data-action]').forEach(x=>x.disabled=false);status()}}
 function fmt(v,suffix=''){return v===null||v===undefined||v===''?'–':v+suffix}
 async function status(){try{let x=await q('/api/status'),h=x.health,j=x.job,t=x.telemetry||{},a=t.activity||{},g=(t.gpus||[])[0],m=t.memory,p=t.process,n=t.nvme;if(j&&j.running)$('state').textContent='Aktion läuft: '+j.action+' …';else if(h)$('state').textContent='Server läuft';else $('state').textContent='Server nicht aktiv';$('phase').textContent=a.stage||'–';$('activity').textContent=a.age_seconds===null?'–':'Letztes Log vor '+a.age_seconds+' s';let metric=a.metrics||{},context=metric.context_tokens||0,capacity=(t.server||{}).context||0;$('context_fill').textContent=context&&capacity?context.toLocaleString('de-DE')+' / '+capacity.toLocaleString('de-DE'):'–';$('context_meta').textContent=context&&capacity?(100*context/capacity).toFixed(1)+' % belegt':metric.prompt_tokens?'Prompt: '+metric.prompt_tokens+' Tokens':'Noch keine Anfrage';$('prefill_speed').textContent=metric.prefill_toks?metric.prefill_toks.toFixed(1)+' tok/s':'–';$('prefill_meta').textContent=metric.prefill_ms?metric.prefill_ms.toFixed(0)+' ms · '+(metric.prompt_tokens||0)+' Tokens':'Noch keine Anfrage';$('toks').textContent=metric.decode_toks?metric.decode_toks.toFixed(2)+' tok/s':'–';$('decode_meta').textContent=metric.decode_ms?metric.decode_ms.toFixed(0)+' ms · '+(metric.generated_tokens||0)+' Tokens':'Noch keine Anfrage';$('total_speed').textContent=metric.total_toks?metric.total_toks.toFixed(2)+' tok/s':'–';$('mtp_meta').textContent=metric.mtp?('MTP: '+metric.mtp+(metric.mtp_accept_pct!==undefined?' · Akzeptanz '+metric.mtp_accept_pct.toFixed(1)+' %':'')):'MTP: –';$('vram').textContent=g&&g.used_mb?g.used_mb+' / '+g.memory_mb+' MB':'–';$('gpuutil').textContent=g&&g.utilization?('GPU-Auslastung: '+g.utilization+' %'):'–';$('ram').textContent=m?m.used_gib+' / '+m.total_gib+' GiB':'–';$('processmem').textContent=p&&p.working_set_gib?('Server: '+p.working_set_gib+' GiB Working Set'):'Prozess: –';$('nvme').textContent=n&&n.cache_gib!==undefined?n.cache_gib+' GiB Cache':'–';$('nvmefree').textContent=n&&n.free_gib!==undefined?n.free_gib+' GiB frei':'–';$('event').textContent=a.event||'–';$('details').textContent=JSON.stringify({health:x.health,models:x.models,server:t.server,job:j},null,2);$('output').textContent=(x.logs||'')||'Noch keine Log-Ausgabe.'}catch(e){$('state').textContent='Dashboard wartet auf den Server';$('event').textContent=String(e);$('output').textContent=String(e)}finally{clearTimeout(statusTimer);statusTimer=setTimeout(status,2000)}}
+async function webuiStatus(){try{let w=await q('/api/openwebui');$('webui_phase').textContent='Open WebUI: '+(w.phase||'–');$('webui_meta').textContent=w.ready?'bereit unter '+w.url:(w.job_running?'läuft seit '+(w.elapsed_seconds||0)+' s':'nicht bereit');$('webui_output').textContent=w.log||'Noch keine OpenWebUI-Ausgabe.'}catch(e){$('webui_phase').textContent='Open WebUI: Status nicht erreichbar';$('webui_meta').textContent=String(e);$('webui_output').textContent=String(e)}finally{setTimeout(webuiStatus,2000)}}
 load();
+webuiStatus();
 </script>'''
 
 
